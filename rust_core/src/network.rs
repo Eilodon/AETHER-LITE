@@ -8,6 +8,9 @@
 
 use crate::config::Config;
 use crate::error::AetherError;
+use crate::security::{SecureKey, SecurityManager};
+use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+use chacha20::ChaCha20;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -116,6 +119,7 @@ pub async fn download_file_to_fd(
     peer_port: u16,
     ticket: String,
     self_peer_id: String,
+    transport_key: SecureKey,
     expected_sha256: String,
     resume_from: u64,
     fd: i32,
@@ -125,6 +129,11 @@ pub async fn download_file_to_fd(
             "expected_sha256 is required for downloads".into(),
         ));
     }
+
+    // SAFETY: the caller transferred exclusive fd ownership to Rust at the
+    // FFI boundary. Taking ownership here guarantees the fd is closed on every
+    // early-return path below, including connect/request/header failures.
+    let mut file = unsafe { File::from_raw_fd(fd) };
 
     let addr = format!("{}:{}", peer_ip, peer_port);
     info!("Connecting to peer {} (resume_from={})", addr, resume_from);
@@ -160,8 +169,6 @@ pub async fn download_file_to_fd(
     let resp = read_http_response(&mut stream).await?;
 
     // ── Zero-copy write + SHA-256 ─────────────────────────────────────────────
-    // SAFETY: caller transferred FD ownership.
-    let mut file = unsafe { File::from_raw_fd(fd) };
     if resume_from > 0 {
         file.seek(SeekFrom::Start(resume_from))
             .map_err(|e| AetherError::NetworkError(format!("Resume seek failed: {}", e)))?;
@@ -169,14 +176,20 @@ pub async fn download_file_to_fd(
     let mut writer = BufWriter::new(file);
     let mut hasher = Sha256::new();
     let mut written = 0u64;
+    let session_key = SecurityManager::derive_session_stream_key(&transport_key, &ticket)?;
+    let session_nonce = SecurityManager::derive_session_nonce(&ticket);
+    let mut cipher = ChaCha20::new((&session_key).into(), (&session_nonce).into());
+    cipher.seek(resume_from);
 
     // Body bytes that arrived in the same reads as the headers.
     if !resp.body_prefix.is_empty() {
+        let mut decrypted = resp.body_prefix.clone();
+        cipher.apply_keystream(&mut decrypted);
         writer
-            .write_all(&resp.body_prefix)
+            .write_all(&decrypted)
             .map_err(|e| AetherError::InternalError(format!("Initial write failed: {}", e)))?;
-        hasher.update(&resp.body_prefix);
-        written += resp.body_prefix.len() as u64;
+        hasher.update(&decrypted);
+        written += decrypted.len() as u64;
     }
 
     // Switch to blocking I/O for the bulk transfer loop.
@@ -192,11 +205,12 @@ pub async fn download_file_to_fd(
         match std_stream.read(&mut chunk_buf) {
             Ok(0) => break,
             Ok(k) => {
-                let data = &chunk_buf[..k];
+                let mut decrypted = chunk_buf[..k].to_vec();
+                cipher.apply_keystream(&mut decrypted);
                 writer
-                    .write_all(data)
+                    .write_all(&decrypted)
                     .map_err(|e| AetherError::NetworkError(format!("Write failed: {}", e)))?;
-                hasher.update(data);
+                hasher.update(&decrypted);
                 written += k as u64;
             }
             Err(e) => return Err(AetherError::NetworkError(format!("Read failed: {}", e))),
@@ -345,6 +359,8 @@ pub async fn ping_peer(peer_ip: &str, peer_port: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::IntoRawFd;
+    use tempfile::NamedTempFile;
 
     // ── Header parser unit tests ──────────────────────────────────────────────
     // Logic extracted from read_http_response for isolation testing
@@ -444,5 +460,36 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("aabb"));
         assert!(msg.contains("ccdd"));
+    }
+
+    #[tokio::test]
+    async fn fd_is_closed_on_early_connect_failure() {
+        let temp = NamedTempFile::new().unwrap();
+        let fd = std::fs::OpenOptions::new()
+            .write(true)
+            .open(temp.path())
+            .unwrap()
+            .into_raw_fd();
+
+        let proc_path = format!("/proc/self/fd/{}", fd);
+        assert!(std::path::Path::new(&proc_path).exists());
+
+        let result = download_file_to_fd(
+            "127.0.0.1".into(),
+            1,
+            "ticket".into(),
+            "peer-a".into(),
+            SecureKey(vec![7u8; 32]),
+            "00".repeat(32),
+            0,
+            fd,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(
+            !std::path::Path::new(&proc_path).exists(),
+            "fd should be closed on early-return paths"
+        );
     }
 }

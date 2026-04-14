@@ -238,6 +238,84 @@ final class DataHexTests: XCTestCase {
     }
 }
 
+final class PeerTrustTests: XCTestCase {
+
+    func test_onboardingPayloadRoundtripPreservesPin() throws {
+        let publicKeyHex = "04" + String(repeating: "11", count: 64)
+        let uri = try PeerTrust.createOnboardingURI(
+            peerId: "peer-a",
+            publicKeyHex: publicKeyHex,
+            protocolVersion: "v2.3-swarm-fixed"
+        )
+
+        let pin = try PeerTrust.parseOnboardingPayload(uri, nowEpochMs: 1234)
+        XCTAssertEqual(pin.peerId, "peer-a")
+        XCTAssertEqual(pin.publicKeyHex, publicKeyHex)
+        XCTAssertEqual(pin.trustMode, .qrPinned)
+        XCTAssertEqual(pin.addedAtEpochMs, 1234)
+        XCTAssertEqual(pin.publicKeySha256, PeerTrust.fingerprintHex(Data(hexString: publicKeyHex)!))
+    }
+
+    func test_tamperedOnboardingPayloadIsRejected() {
+        let payload = #"{"peer_id":"peer-a","protocol_version":"v2","public_key_hex":"04\#(String(repeating: "22", count: 64))","public_key_sha256":"deadbeef","scheme":"aether-peer-pin-v1"}"#
+        XCTAssertThrowsError(try PeerTrust.parseOnboardingPayload(payload))
+    }
+
+    func test_handshakeWithPinnedPeerUpdatesTimestampWithoutRetrusting() throws {
+        let publicKeyHex = "04" + String(repeating: "33", count: 64)
+        let existing = try PeerTrust.parseOnboardingPayload(
+            try PeerTrust.createOnboardingPayload(
+                peerId: "peer-a",
+                publicKeyHex: publicKeyHex,
+                protocolVersion: "v2"
+            ),
+            nowEpochMs: 100
+        )
+
+        let decision = try PeerTrust.evaluateHandshake(
+            peerId: "peer-a",
+            publicKeyHex: publicKeyHex,
+            protocolVersion: "v3",
+            existingPin: existing,
+            trustOnFirstUse: false,
+            nowEpochMs: 500
+        )
+
+        XCTAssertFalse(decision.trustEstablishedNow)
+        XCTAssertEqual(decision.pin.trustMode, .qrPinned)
+        XCTAssertEqual(decision.pin.addedAtEpochMs, 100)
+        XCTAssertEqual(decision.pin.lastValidatedAtEpochMs, 500)
+        XCTAssertEqual(decision.pin.protocolVersion, "v3")
+    }
+
+    func test_handshakeCreatesTofuPinWhenAllowed() throws {
+        let decision = try PeerTrust.evaluateHandshake(
+            peerId: "peer-tofu",
+            publicKeyHex: "04" + String(repeating: "44", count: 64),
+            protocolVersion: "v2",
+            existingPin: nil,
+            trustOnFirstUse: true,
+            nowEpochMs: 250
+        )
+
+        XCTAssertTrue(decision.trustEstablishedNow)
+        XCTAssertEqual(decision.pin.trustMode, .tofu)
+        XCTAssertEqual(decision.pin.peerId, "peer-tofu")
+    }
+
+    func test_handshakeRejectsFirstUseWhenTofuDisabled() {
+        XCTAssertThrowsError(
+            try PeerTrust.evaluateHandshake(
+                peerId: "peer-strict",
+                publicKeyHex: "04" + String(repeating: "55", count: 64),
+                protocolVersion: "v2",
+                existingPin: nil,
+                trustOnFirstUse: false
+            )
+        )
+    }
+}
+
 // ── Heartbeat backoff ─────────────────────────────────────────────────────────
 
 final class HeartbeatBackoffTests: XCTestCase {

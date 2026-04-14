@@ -23,6 +23,13 @@ impl Config {
     /// Maximum concurrent download sessions served simultaneously.
     pub const MAX_CONCURRENT_DOWNLOADS: usize = 10;
 
+    /// Current bspatch pipeline buffers the old file and patch delta in RAM.
+    /// Keep the combined input under this ceiling to avoid OOM on low-RAM devices.
+    pub const MAX_PATCH_BUFFERED_INPUT_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
+    /// Individual patch delta ceiling. Typical mobile updates are well below this.
+    pub const MAX_PATCH_DELTA_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
     /// Obfuscated auth header name.
     #[inline(always)]
     pub fn get_header_key() -> &'static str {

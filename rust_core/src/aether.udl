@@ -23,6 +23,9 @@ interface AetherEngine {
     void set_self_peer_id(string peer_id);
 
     [Throws=AetherError]
+    void set_self_identity_public_key(bytes public_key_x962);
+
+    [Throws=AetherError]
     u16 start_server();
 
     void stop_server();
@@ -57,6 +60,9 @@ interface AetherEngine {
 
     [Throws=AetherError]
     u64 decompress_file(i32 compressed_fd, i32 output_fd);
+
+    [Throws=AetherError]
+    string canonicalize_json(string json);
 
     [Throws=AetherError]
     boolean verify_manifest(

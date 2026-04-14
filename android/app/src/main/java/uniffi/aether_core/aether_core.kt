@@ -396,6 +396,8 @@ internal interface UniffiLib : Library {
     ): Pointer
     fun uniffi_aether_core_fn_method_aetherengine_apply_patch(`ptr`: Pointer,`oldFd`: Int,`patchFd`: Int,`newFd`: Int,`expectedPatchSha256`: RustBuffer.ByValue,`expectedOutputSha256`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_aether_core_fn_method_aetherengine_canonicalize_json(`ptr`: Pointer,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
     fun uniffi_aether_core_fn_method_aetherengine_decompress_file(`ptr`: Pointer,`compressedFd`: Int,`outputFd`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     fun uniffi_aether_core_fn_method_aetherengine_download_model(`ptr`: Pointer,`peerIp`: RustBuffer.ByValue,`peerPort`: Short,`ticket`: RustBuffer.ByValue,`expectedSha256`: RustBuffer.ByValue,`resumeFrom`: Long,`fd`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -411,6 +413,8 @@ internal interface UniffiLib : Library {
     fun uniffi_aether_core_fn_method_aetherengine_register_peer_key(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`sharedSecret`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_set_self_peer_id(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_aether_core_fn_method_aetherengine_set_self_identity_public_key(`ptr`: Pointer,`publicKeyX962`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
     ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_start_server(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Short
@@ -1034,6 +1038,8 @@ object NoPointer
 public interface AetherEngineInterface {
     
     fun `applyPatch`(`oldFd`: Int, `patchFd`: Int, `newFd`: Int, `expectedPatchSha256`: String, `expectedOutputSha256`: String)
+
+    fun `canonicalizeJson`(`json`: String): String
     
     fun `decompressFile`(`compressedFd`: Int, `outputFd`: Int): ULong
     
@@ -1050,6 +1056,8 @@ public interface AetherEngineInterface {
     fun `registerPeerKey`(`peerId`: String, `sharedSecret`: ByteArray)
     
     fun `setSelfPeerId`(`peerId`: String)
+
+    fun `setSelfIdentityPublicKey`(`publicKeyX962`: ByteArray)
     
     fun `startServer`(): UShort
     
@@ -1107,6 +1115,18 @@ open class AetherEngine : FFIObject, AetherEngineInterface {
         FfiConverterInt.lower(`oldFd`),FfiConverterInt.lower(`patchFd`),FfiConverterInt.lower(`newFd`),FfiConverterString.lower(`expectedPatchSha256`),FfiConverterString.lower(`expectedOutputSha256`),
         _status)
 }
+        }
+
+    
+    @Throws(AetherException::class)override fun `canonicalizeJson`(`json`: String): String =
+        callWithPointer {
+    uniffiRustCallWithError(AetherException) { _status ->
+    UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_canonicalize_json(it,
+        FfiConverterString.lower(`json`),
+        _status)
+}
+        }.let {
+            FfiConverterString.lift(it)
         }
     
     
@@ -1194,6 +1214,16 @@ open class AetherEngine : FFIObject, AetherEngineInterface {
     uniffiRustCall() { _status ->
     UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_set_self_peer_id(it,
         FfiConverterString.lower(`peerId`),
+        _status)
+}
+        }
+
+
+    @Throws(AetherException::class)override fun `setSelfIdentityPublicKey`(`publicKeyX962`: ByteArray) =
+        callWithPointer {
+    uniffiRustCallWithError(AetherException) { _status ->
+    UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_set_self_identity_public_key(it,
+        FfiConverterByteArray.lower(`publicKeyX962`),
         _status)
 }
         }
@@ -1387,4 +1417,3 @@ public object FfiConverterTypeAetherError : FfiConverterRustBuffer<AetherExcepti
     }
 
 }
-

@@ -7,7 +7,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use ring::signature::{self, UnparsedPublicKey};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -67,9 +67,16 @@ impl SecurityManager {
     pub fn generate_ticket(
         model_id: &str,
         version: &str,
+        issuer_peer_id: &str,
         secret: &SecureKey,
     ) -> Result<String, AetherError> {
-        let payload = format!("{}|{}|{}", model_id, version, Self::now_secs());
+        let payload = format!(
+            "{}|{}|{}|{}",
+            model_id,
+            version,
+            Self::now_secs(),
+            issuer_peer_id
+        );
         let mut mac = HmacSha256::new_from_slice(&secret.0)
             .map_err(|_| AetherError::InternalError("HMAC init failed".into()))?;
         mac.update(payload.as_bytes());
@@ -130,9 +137,38 @@ impl SecurityManager {
     /// Context label `b"aether-hmac-v1"` ensures keys derived for different
     /// purposes are independent even if the IKM (input key material) is reused.
     pub fn derive_hmac_key(raw_ecdh_secret: &[u8]) -> Result<[u8; 32], AetherError> {
+        Self::derive_labeled_key(raw_ecdh_secret, b"aether-hmac-v1")
+    }
+
+    pub fn derive_transport_key(raw_ecdh_secret: &[u8]) -> Result<[u8; 32], AetherError> {
+        Self::derive_labeled_key(raw_ecdh_secret, b"aether-transport-v1")
+    }
+
+    pub fn derive_session_stream_key(
+        transport_key: &SecureKey,
+        ticket: &str,
+    ) -> Result<[u8; 32], AetherError> {
+        let hk = Hkdf::<Sha256>::new(Some(ticket.as_bytes()), &transport_key.0);
+        let mut output = [0u8; 32];
+        hk.expand(b"aether-stream-session-v1", &mut output)
+            .map_err(|_| AetherError::InternalError("HKDF stream expand failed".into()))?;
+        Ok(output)
+    }
+
+    pub fn derive_session_nonce(ticket: &str) -> [u8; 12] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"aether-stream-nonce-v1");
+        hasher.update(ticket.as_bytes());
+        let digest = hasher.finalize();
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&digest[..12]);
+        nonce
+    }
+
+    fn derive_labeled_key(raw_ecdh_secret: &[u8], label: &[u8]) -> Result<[u8; 32], AetherError> {
         let hk = Hkdf::<Sha256>::new(None, raw_ecdh_secret);
         let mut output = [0u8; 32];
-        hk.expand(b"aether-hmac-v1", &mut output)
+        hk.expand(label, &mut output)
             .map_err(|_| AetherError::InternalError("HKDF expand failed".into()))?;
         Ok(output)
     }
@@ -151,7 +187,8 @@ mod tests {
     #[test]
     fn ticket_roundtrip() {
         let secret = make_key(&[0xAB; 32]);
-        let ticket = SecurityManager::generate_ticket("model-x", "1.0", &secret).unwrap();
+        let ticket =
+            SecurityManager::generate_ticket("model-x", "1.0", "peer-seeder", &secret).unwrap();
         assert!(SecurityManager::verify_ticket(&ticket, &secret).is_ok());
     }
 
@@ -159,14 +196,16 @@ mod tests {
     fn ticket_wrong_key_fails() {
         let secret1 = make_key(&[0xAB; 32]);
         let secret2 = make_key(&[0xCD; 32]);
-        let ticket = SecurityManager::generate_ticket("model-x", "1.0", &secret1).unwrap();
+        let ticket =
+            SecurityManager::generate_ticket("model-x", "1.0", "peer-seeder", &secret1).unwrap();
         assert!(SecurityManager::verify_ticket(&ticket, &secret2).is_err());
     }
 
     #[test]
     fn ticket_tampered_payload_fails() {
         let secret = make_key(&[0xAB; 32]);
-        let ticket = SecurityManager::generate_ticket("model-x", "1.0", &secret).unwrap();
+        let ticket =
+            SecurityManager::generate_ticket("model-x", "1.0", "peer-seeder", &secret).unwrap();
         // Corrupt the payload portion
         let bad_ticket = ticket.replace("model-x", "evil-model");
         assert!(SecurityManager::verify_ticket(&bad_ticket, &secret).is_err());
@@ -183,7 +222,7 @@ mod tests {
     fn now_secs_returns_reasonable_timestamp() {
         // generate_ticket uses now_secs internally; if it panics, the test fails.
         let secret = make_key(&[0xAB; 32]);
-        let ticket = SecurityManager::generate_ticket("m", "1", &secret).unwrap();
+        let ticket = SecurityManager::generate_ticket("m", "1", "peer-seeder", &secret).unwrap();
         let parts: Vec<&str> = ticket.splitn(2, '.').collect();
         let fields: Vec<&str> = parts[0].split('|').collect();
         let ts: u64 = fields[2].parse().expect("Timestamp must parse as u64");
@@ -204,6 +243,13 @@ mod tests {
     fn derive_hmac_key_output_is_32_bytes() {
         let raw = vec![0xFFu8; 32];
         let derived = SecurityManager::derive_hmac_key(&raw).unwrap();
+        assert_eq!(derived.len(), 32);
+    }
+
+    #[test]
+    fn derive_transport_key_output_is_32_bytes() {
+        let raw = vec![0x44u8; 32];
+        let derived = SecurityManager::derive_transport_key(&raw).unwrap();
         assert_eq!(derived.len(), 32);
     }
 }

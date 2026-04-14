@@ -1,18 +1,16 @@
 package com.b_one.aether
 
-import com.b_one.aether.util.CanonicalJson
+import com.b_one.aether.security.PeerTrust
+import com.b_one.aether.security.PeerTrustMode
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.junit.runners.JUnit4
-import org.json.JSONArray
 import java.math.BigInteger
 import java.security.MessageDigest
 
 @RunWith(JUnit4::class)
 class AetherUnitTests {
-
-    private fun toCanonicalJson(map: Map<String, Any?>): String = CanonicalJson.fromMap(map)
 
     private fun hexToBytes(hex: String): ByteArray {
         require(hex.length % 2 == 0)
@@ -35,74 +33,6 @@ class AetherUnitTests {
         }
         if (raw.size == size) return raw
         return ByteArray(size - raw.size) + raw
-    }
-
-    @Test
-    fun `canonical JSON sorts keys`() {
-        val json = toCanonicalJson(mapOf("z" to "last", "a" to "first", "m" to "middle"))
-        assertEquals("""{"a":"first","m":"middle","z":"last"}""", json)
-    }
-
-    @Test
-    fun `canonical JSON matches forge py output format`() {
-        val payload = mapOf(
-            "id" to "llm-mini",
-            "version" to "2.0",
-            "timestamp" to 1713000000
-        )
-        assertEquals(
-            """{"id":"llm-mini","timestamp":1713000000,"version":"2.0"}""",
-            toCanonicalJson(payload)
-        )
-    }
-
-    @Test
-    fun `canonical JSON handles nested objects`() {
-        val payload = mapOf(
-            "full" to mapOf("size" to 1024, "url" to "https://cdn/model.zst"),
-            "id" to "m"
-        )
-        assertEquals(
-            """{"full":{"size":1024,"url":"https://cdn/model.zst"},"id":"m"}""",
-            toCanonicalJson(payload)
-        )
-    }
-
-    @Test
-    fun `canonical JSON handles arrays`() {
-        val payload = mapOf(
-            "arches" to JSONArray(listOf("arm64", "x86_64")),
-            "id" to "m"
-        )
-        assertEquals(
-            """{"arches":["arm64","x86_64"],"id":"m"}""",
-            toCanonicalJson(payload)
-        )
-    }
-
-    @Test
-    fun `canonical JSON escapes key characters`() {
-        val json = toCanonicalJson(mapOf("quo\"te" to "value"))
-        assertEquals("""{"quo\"te":"value"}""", json)
-    }
-
-    @Test
-    fun `canonical JSON escapes string values`() {
-        val json = toCanonicalJson(mapOf("path" to "C:\\Users\\admin", "quote" to "say \"hi\""))
-        assertEquals(
-            """{"path":"C:\\Users\\admin","quote":"say \"hi\""}""",
-            json
-        )
-    }
-
-    @Test
-    fun `canonical JSON handles null values`() {
-        assertEquals("""{"patch":null}""", toCanonicalJson(mapOf("patch" to null)))
-    }
-
-    @Test
-    fun `canonical JSON empty object`() {
-        assertEquals("{}", toCanonicalJson(emptyMap()))
     }
 
     @Test
@@ -133,6 +63,83 @@ class AetherUnitTests {
         val a = sha256Hex("data_v1".toByteArray())
         val b = sha256Hex("data_v2".toByteArray())
         assertNotEquals(a, b)
+    }
+
+    @Test
+    fun `onboarding payload roundtrip preserves pin`() {
+        val publicKeyHex = "04" + "11".repeat(64)
+        val uri = PeerTrust.createOnboardingUri(
+            peerId = "peer-a",
+            publicKeyHex = publicKeyHex,
+            protocolVersion = "v2.3-swarm-fixed"
+        )
+
+        val pin = PeerTrust.parseOnboardingPayload(uri, nowEpochMs = 1234L)
+        assertEquals("peer-a", pin.peerId)
+        assertEquals(publicKeyHex, pin.publicKeyHex)
+        assertEquals(PeerTrustMode.QR_PINNED, pin.trustMode)
+        assertEquals(1234L, pin.addedAtEpochMs)
+        assertEquals(sha256Hex(hexToBytes(publicKeyHex)), pin.publicKeySha256)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `onboarding payload rejects tampered fingerprint`() {
+        val payload = """
+            {"peer_id":"peer-a","protocol_version":"v2","public_key_hex":"04${"22".repeat(64)}","public_key_sha256":"deadbeef","scheme":"aether-peer-pin-v1"}
+        """.trimIndent()
+        PeerTrust.parseOnboardingPayload(payload)
+    }
+
+    @Test
+    fun `handshake with pinned peer updates timestamp without retrusting`() {
+        val publicKeyHex = "04" + "33".repeat(64)
+        val existing = PeerTrust.parseOnboardingPayload(
+            PeerTrust.createOnboardingPayload("peer-a", publicKeyHex, "v2"),
+            nowEpochMs = 100L
+        )
+
+        val decision = PeerTrust.evaluateHandshake(
+            peerId = "peer-a",
+            publicKeyHex = publicKeyHex,
+            protocolVersion = "v3",
+            existingPin = existing,
+            trustOnFirstUse = false,
+            nowEpochMs = 500L
+        )
+
+        assertFalse(decision.trustEstablishedNow)
+        assertEquals(PeerTrustMode.QR_PINNED, decision.pin.trustMode)
+        assertEquals(100L, decision.pin.addedAtEpochMs)
+        assertEquals(500L, decision.pin.lastValidatedAtEpochMs)
+        assertEquals("v3", decision.pin.protocolVersion)
+    }
+
+    @Test
+    fun `handshake creates TOFU pin on first use when allowed`() {
+        val publicKeyHex = "04" + "44".repeat(64)
+        val decision = PeerTrust.evaluateHandshake(
+            peerId = "peer-tofu",
+            publicKeyHex = publicKeyHex,
+            protocolVersion = "v2",
+            existingPin = null,
+            trustOnFirstUse = true,
+            nowEpochMs = 250L
+        )
+
+        assertTrue(decision.trustEstablishedNow)
+        assertEquals(PeerTrustMode.TOFU, decision.pin.trustMode)
+        assertEquals("peer-tofu", decision.pin.peerId)
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun `handshake rejects first use when TOFU disabled`() {
+        PeerTrust.evaluateHandshake(
+            peerId = "peer-strict",
+            publicKeyHex = "04" + "55".repeat(64),
+            protocolVersion = "v2",
+            existingPin = null,
+            trustOnFirstUse = false
+        )
     }
 
     @Test

@@ -27,6 +27,8 @@ final class AetherManager: ObservableObject {
     private var monitor    = NWPathMonitor()
     private let monitorQ   = DispatchQueue(label: "com.b_one.aether.network")
     private var heartbeatTask: Task<Void, Never>?
+    private let peerPinStore = PeerPinStore()
+    private let protocolVersion = "v2.3-swarm-fixed"
 
     private static let MAX_HEARTBEAT_FAILURES = 5
 
@@ -37,6 +39,9 @@ final class AetherManager: ObservableObject {
             let eng = AetherEngine()
 
             eng.setSelfPeerId(peerId: self.getStablePeerId())
+            if let publicKey = Vault.shared.getPublicKeyData() {
+                try? eng.setSelfIdentityPublicKey(publicKeyX962: [UInt8](publicKey))
+            }
 
             await MainActor.run {
                 self.engine = eng
@@ -88,6 +93,91 @@ final class AetherManager: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    func performAuthenticatedHandshake(
+        peerIp: String,
+        peerPort: UInt16,
+        expectedPeerId: String? = nil,
+        expectedPeerPublicKeySha256: String? = nil,
+        trustOnFirstUse: Bool = true
+    ) async throws -> (peerId: String, publicKeySha256: String, trustEstablishedNow: Bool) {
+        guard let engine else {
+            throw AetherError.InternalError("Engine not initialised")
+        }
+
+        let url = URL(string: "http://\(peerIp):\(peerPort)/identity")!
+        let (data, _) = try await URLSession.shared.data(from: url)
+        let doc = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let peerId = doc?["peer_id"] as? String,
+              let publicKeyHex = doc?["public_key_hex"] as? String,
+              !publicKeyHex.isEmpty,
+              let publicKey = Data(hexString: publicKeyHex)
+        else {
+            throw AetherError.InternalError("Peer identity document invalid")
+        }
+        let peerProtocolVersion = (doc?["protocol_version"] as? String) ?? protocolVersion
+
+        if let expectedPeerId, expectedPeerId != peerId {
+            throw AetherError.SecurityError("Peer ID mismatch")
+        }
+
+        let fingerprint = PeerTrust.fingerprintHex(publicKey)
+        if let expectedPeerPublicKeySha256, expectedPeerPublicKeySha256 != fingerprint {
+            throw AetherError.SecurityError("Peer public key fingerprint mismatch")
+        }
+
+        let trustDecision = try PeerTrust.evaluateHandshake(
+            peerId: peerId,
+            publicKeyHex: publicKeyHex,
+            protocolVersion: peerProtocolVersion,
+            existingPin: peerPinStore.get(peerId: peerId),
+            trustOnFirstUse: trustOnFirstUse
+        )
+
+        guard let sharedSecret = Vault.shared.performHandshake(peerPublicKeyBytes: publicKey) else {
+            throw AetherError.KeyExchangeFailed
+        }
+
+        try engine.registerPeerKey(peerId: peerId, sharedSecret: [UInt8](sharedSecret))
+        peerPinStore.save(trustDecision.pin)
+        return (peerId, fingerprint, trustDecision.trustEstablishedNow)
+    }
+
+    func exportSelfPeerOnboardingPayload() throws -> String {
+        guard let publicKey = Vault.shared.getPublicKeyData() else {
+            throw AetherError.InternalError("Identity key unavailable")
+        }
+        return try PeerTrust.createOnboardingPayload(
+            peerId: getStablePeerId(),
+            publicKeyHex: publicKey.map { String(format: "%02x", $0) }.joined(),
+            protocolVersion: protocolVersion
+        )
+    }
+
+    func exportSelfPeerOnboardingURI() throws -> String {
+        guard let publicKey = Vault.shared.getPublicKeyData() else {
+            throw AetherError.InternalError("Identity key unavailable")
+        }
+        return try PeerTrust.createOnboardingURI(
+            peerId: getStablePeerId(),
+            publicKeyHex: publicKey.map { String(format: "%02x", $0) }.joined(),
+            protocolVersion: protocolVersion
+        )
+    }
+
+    func importPeerPin(onboardingPayloadOrURI: String) throws -> PeerPin {
+        let pin = try PeerTrust.parseOnboardingPayload(onboardingPayloadOrURI)
+        peerPinStore.save(pin)
+        return pin
+    }
+
+    func getPinnedPeer(peerId: String) -> PeerPin? {
+        peerPinStore.get(peerId: peerId)
+    }
+
+    func removePinnedPeer(peerId: String) {
+        peerPinStore.remove(peerId: peerId)
     }
 
     // ── Zero-Copy Download ─────────────────────────────────────────────────────
@@ -154,6 +244,10 @@ final class AetherManager: ObservableObject {
     /// Decompress a `.zst` file produced by forge.py.
     /// Automatically deletes the compressed file on success.
     func decompressModel(compressedUrl: URL, outputUrl: URL) async throws {
+        guard let engine else {
+            throw AetherError.InternalError("Engine not initialised")
+        }
+
         if !FileManager.default.fileExists(atPath: outputUrl.path) {
             FileManager.default.createFile(atPath: outputUrl.path, contents: nil)
         }
@@ -169,7 +263,7 @@ final class AetherManager: ObservableObject {
         }
 
         let bytesWritten = try await Task.detached(priority: .utility) {
-            try self.engine?.decompressFile(compressedFd: srcFd, outputFd: dstFd) ?? 0
+            try engine.decompressFile(compressedFd: srcFd, outputFd: dstFd)
         }.value
 
         // Both fds closed by Rust. Remove the compressed file.
@@ -199,7 +293,8 @@ final class AetherManager: ObservableObject {
         }
 
         // ── 1. Verify manifest signature ──────────────────────────────────────
-        let (canonicalJson, signatureHex) = try parseManifest(manifestJson)
+        let (payloadJson, signatureHex) = try parseManifest(manifestJson)
+        let canonicalJson = try engine.canonicalizeJson(json: payloadJson)
 
         let valid = Vault.shared.verifyManifestSignature(
             canonicalJson: canonicalJson,
@@ -335,7 +430,7 @@ final class AetherManager: ObservableObject {
 
     // ── Manifest JSON helpers ─────────────────────────────────────────────────
 
-    /// Parse manifest.json → (canonicalJson, signatureHex)
+    /// Parse manifest.json → (payloadJson, signatureHex)
     private func parseManifest(_ json: String) throws -> (String, String) {
         guard let data = json.data(using: .utf8),
               let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -344,84 +439,11 @@ final class AetherManager: ObservableObject {
         else {
             throw AetherError.InternalError("Invalid manifest JSON")
         }
-        let canonical = canonicalJSON(payload)
-        return (canonical, signature)
-    }
-
-    /// Produce deterministic sorted-key JSON matching forge.py's output.
-    ///
-    /// Fix v2.3.2: String values are now properly escaped via `jsonEscapeString(_:)`
-    /// so that values containing `"`, `\`, or control characters produce valid JSON
-    /// and match the output of Python's `json.dumps()`. Previously `"\"\(str)\""` would
-    /// produce invalid JSON (and a different canonical string than forge.py) for any
-    /// model ID or version field containing a special character.
-    private func canonicalJSON(_ dict: [String: Any]) -> String {
-        let sortedKeys = dict.keys.sorted()
-        let pairs = sortedKeys.map { key -> String in
-            let val = dict[key]!
-            let valStr: String
-            if let nested = val as? [String: Any] {
-                valStr = canonicalJSON(nested)
-            } else if let arr = val as? [Any] {
-                valStr = canonicalJSONArray(arr)
-            } else if let str = val as? String {
-                valStr = jsonEscapeString(str)   // Fix: proper JSON string escaping
-            } else if val is NSNull {
-                valStr = "null"
-            } else {
-                valStr = "\(val)"
-            }
-            return "\"\(jsonEscapeRawKey(key))\":\(valStr)"
+        let payloadData = try JSONSerialization.data(withJSONObject: payload, options: [])
+        guard let payloadJson = String(data: payloadData, encoding: .utf8) else {
+            throw AetherError.InternalError("Payload JSON encoding failed")
         }
-        return "{\(pairs.joined(separator: ","))}"
-    }
-
-    /// Wrap a Swift String in JSON quotes with all required escape sequences.
-    /// Handles: `"` → `\"`, `\` → `\\`, control chars → `\uXXXX`.
-    /// Matches Python's `json.dumps(s)` output for any valid Unicode string.
-    private func jsonEscapeString(_ s: String) -> String {
-        var out = "\""
-        for scalar in s.unicodeScalars {
-            switch scalar.value {
-            case 0x22: out += "\\\""    // quotation mark
-            case 0x5C: out += "\\\\"   // reverse solidus
-            case 0x08: out += "\\b"    // backspace
-            case 0x09: out += "\\t"    // tab
-            case 0x0A: out += "\\n"    // newline
-            case 0x0C: out += "\\f"    // form feed
-            case 0x0D: out += "\\r"    // carriage return
-            case 0x00..<0x20:          // other control characters
-                out += String(format: "\\u%04x", scalar.value)
-            default:
-                out += String(scalar)
-            }
-        }
-        out += "\""
-        return out
-    }
-
-    private func canonicalJSONArray(_ values: [Any]) -> String {
-        let rendered = values.map { value -> String in
-            if let nested = value as? [String: Any] {
-                return canonicalJSON(nested)
-            } else if let arr = value as? [Any] {
-                return canonicalJSONArray(arr)
-            } else if let str = value as? String {
-                return jsonEscapeString(str)
-            } else if value is NSNull {
-                return "null"
-            } else {
-                return "\(value)"
-            }
-        }
-        return "[\(rendered.joined(separator: ","))]"
-    }
-
-    /// Escape a JSON object key (same rules as string values).
-    private func jsonEscapeRawKey(_ key: String) -> String {
-        // Keys follow the same escaping rules; strip surrounding quotes added by jsonEscapeString.
-        let escaped = jsonEscapeString(key)
-        return String(escaped.dropFirst().dropLast())
+        return (payloadJson, signature)
     }
 }
 

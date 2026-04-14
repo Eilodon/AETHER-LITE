@@ -5,6 +5,7 @@
 //!   • Verify SHA-256 of the patch file before applying (detects corruption).
 //!   • Verify SHA-256 of the output file after applying (guarantees correctness).
 
+use crate::config::Config;
 use crate::error::AetherError;
 use qbsdiff::Bspatch;
 use sha2::{Digest, Sha256};
@@ -47,6 +48,7 @@ pub fn apply_patch_fds(
     let old_file = unsafe { File::from_raw_fd(old_fd) };
     let patch_file = unsafe { File::from_raw_fd(patch_fd) };
     let new_file = unsafe { File::from_raw_fd(new_fd) };
+    enforce_patch_memory_gate(&old_file, &patch_file)?;
 
     // ── 1. Verify patch file integrity before applying ─────────────────────
     let old_bytes = read_file_to_bytes(old_file)
@@ -106,6 +108,36 @@ fn read_file_to_bytes(mut f: File) -> std::io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+fn enforce_patch_memory_gate(old_file: &File, patch_file: &File) -> Result<(), AetherError> {
+    let old_len = old_file
+        .metadata()
+        .map_err(|e| AetherError::PatchError(format!("Failed to stat old file: {}", e)))?
+        .len();
+    let patch_len = patch_file
+        .metadata()
+        .map_err(|e| AetherError::PatchError(format!("Failed to stat patch file: {}", e)))?
+        .len();
+
+    if patch_len > Config::MAX_PATCH_DELTA_BYTES {
+        return Err(AetherError::PatchError(format!(
+            "Patch delta is {} bytes; current mobile-safe ceiling is {} bytes",
+            patch_len,
+            Config::MAX_PATCH_DELTA_BYTES
+        )));
+    }
+
+    let combined = old_len.saturating_add(patch_len);
+    if combined > Config::MAX_PATCH_BUFFERED_INPUT_BYTES {
+        return Err(AetherError::PatchError(format!(
+            "Current patch pipeline buffers old+patch in RAM ({} bytes), exceeding the {} byte ceiling",
+            combined,
+            Config::MAX_PATCH_BUFFERED_INPUT_BYTES
+        )));
+    }
+
+    Ok(())
 }
 
 /// Reopen the output file via the kernel fd symlink and hash its full contents.
@@ -335,5 +367,38 @@ mod tests {
         );
 
         assert!(matches!(result, Err(AetherError::SecurityError(_))));
+    }
+
+    #[test]
+    fn oversized_patch_file_is_rejected_before_reading() {
+        let old_f = NamedTempFile::new().unwrap();
+        let patch_f = NamedTempFile::new().unwrap();
+        let output_f = NamedTempFile::new().unwrap();
+
+        std::fs::write(old_f.path(), b"old").unwrap();
+        std::fs::write(patch_f.path(), b"patch").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(patch_f.path())
+            .unwrap()
+            .set_len(Config::MAX_PATCH_DELTA_BYTES + 1)
+            .unwrap();
+
+        use std::os::unix::io::IntoRawFd;
+        let result = apply_patch_fds(
+            std::fs::File::open(old_f.path()).unwrap().into_raw_fd(),
+            std::fs::File::open(patch_f.path()).unwrap().into_raw_fd(),
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(output_f.path())
+                .unwrap()
+                .into_raw_fd(),
+            &"00".repeat(32),
+            &"11".repeat(32),
+        );
+
+        assert!(matches!(result, Err(AetherError::PatchError(_))));
+        assert!(result.unwrap_err().to_string().contains("Patch delta"));
     }
 }

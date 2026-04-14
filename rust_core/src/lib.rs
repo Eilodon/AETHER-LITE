@@ -11,6 +11,7 @@
 //!   • `Arc<Runtime>` so runtime outlives engine drop on Android main thread.
 #![allow(clippy::empty_line_after_doc_comments)]
 
+mod canonical_json;
 mod config;
 pub mod decompressor;
 pub mod error;
@@ -18,19 +19,24 @@ mod network;
 pub mod patcher;
 pub mod security;
 
+use crate::canonical_json::canonicalize_json;
 use crate::config::Config;
 use crate::error::AetherError;
 use crate::network::{download_file_to_fd, ping_peer};
 use crate::security::{SecureKey, SecurityManager};
+use async_stream::try_stream;
+use serde::Serialize;
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
+use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
+use chacha20::ChaCha20;
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -38,6 +44,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{Notify, Semaphore};
 use tracing::info;
 
@@ -46,7 +53,7 @@ uniffi::include_scaffolding!("aether");
 // ── Shared server state ───────────────────────────────────────────────────────
 
 struct AppState {
-    peer_keys: DashMap<String, SecureKey>,
+    peer_keys: DashMap<String, PeerKeys>,
     peer_permissions: DashMap<String, HashSet<String>>,
     seen_tickets: DashMap<String, u64>,
     shutdown_notify: Arc<Notify>,
@@ -55,6 +62,25 @@ struct AppState {
     /// Files registered for serving by model_id → absolute path on disk.
     /// Populated by `register_file_for_serving` before a peer connects.
     serve_files: DashMap<String, PathBuf>,
+}
+
+#[derive(Clone)]
+struct PeerKeys {
+    auth_key: SecureKey,
+    transport_key: SecureKey,
+}
+
+#[derive(Clone, Serialize)]
+struct IdentityState {
+    peer_id: String,
+    public_key_hex: String,
+    protocol_version: String,
+}
+
+#[derive(Clone)]
+struct ServerState {
+    app: Arc<AppState>,
+    identity: Arc<IdentityState>,
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -66,6 +92,7 @@ pub struct AetherEngine {
     rt: Arc<Runtime>,
     /// Fix v2.3: node's own UUID; sent as `?pid=` in outbound requests.
     self_peer_id: Arc<RwLock<String>>,
+    self_public_key_x962: Arc<RwLock<Vec<u8>>>,
     /// Port assigned by the OS when `start_server()` is called.
     /// Used by `heartbeat()` to probe the actual TCP server.
     bound_port: Arc<RwLock<Option<u16>>>,
@@ -101,6 +128,7 @@ impl AetherEngine {
             }),
             rt: Arc::new(Runtime::new().expect("Tokio runtime init failed")),
             self_peer_id: Arc::new(RwLock::new(default_id)),
+            self_public_key_x962: Arc::new(RwLock::new(Vec::new())),
             bound_port: Arc::new(RwLock::new(None)),
         }
     }
@@ -111,6 +139,14 @@ impl AetherEngine {
         *self.self_peer_id.write().unwrap() = peer_id;
     }
 
+    pub fn set_self_identity_public_key(&self, public_key_x962: Vec<u8>) -> Result<(), AetherError> {
+        if public_key_x962.len() != 65 || public_key_x962.first().copied() != Some(0x04) {
+            return Err(AetherError::KeyExchangeFailed);
+        }
+        *self.self_public_key_x962.write().unwrap() = public_key_x962;
+        Ok(())
+    }
+
     fn get_self_peer_id(&self) -> String {
         self.self_peer_id.read().unwrap().clone()
     }
@@ -118,15 +154,26 @@ impl AetherEngine {
     // ── Server lifecycle ──────────────────────────────────────────────────────
 
     pub fn start_server(&self) -> Result<u16, AetherError> {
-        let state = self.state.clone();
+        let app_state = self.state.clone();
         let notify = self.state.shutdown_notify.clone();
         let bound_port = self.bound_port.clone();
+        let self_peer_id = self.self_peer_id.clone();
+        let self_public_key_x962 = self.self_public_key_x962.clone();
         let (tx, rx) = std::sync::mpsc::channel::<Result<u16, AetherError>>();
 
         self.rt.spawn(async move {
+            let state = ServerState {
+                app: app_state,
+                identity: Arc::new(IdentityState {
+                peer_id: self_peer_id.read().unwrap().clone(),
+                public_key_hex: hex::encode(self_public_key_x962.read().unwrap().clone()),
+                protocol_version: Config::get_protocol_version().to_string(),
+                }),
+            };
             let app = Router::new()
                 .route("/download", get(download_handler))
                 .route("/ping", get(ping_handler))
+                .route("/identity", get(identity_handler))
                 .with_state(state);
 
             match tokio::net::TcpListener::bind(Config::BIND_ADDRESS).await {
@@ -156,6 +203,10 @@ impl AetherEngine {
         *self.bound_port.write().unwrap() = None;
     }
 
+    pub fn canonicalize_json(&self, json: String) -> Result<String, AetherError> {
+        canonicalize_json(&json)
+    }
+
     // ── Peer management ───────────────────────────────────────────────────────
 
     /// Register a 32-byte raw ECDH shared secret for a peer.
@@ -171,11 +222,15 @@ impl AetherEngine {
         if shared_secret.len() != 32 {
             return Err(AetherError::KeyExchangeFailed);
         }
-        // Derive a proper HMAC key from the raw ECDH output.
-        let derived = SecurityManager::derive_hmac_key(&shared_secret)?;
-        self.state
-            .peer_keys
-            .insert(peer_id, SecureKey(derived.to_vec()));
+        let auth_key = SecurityManager::derive_hmac_key(&shared_secret)?;
+        let transport_key = SecurityManager::derive_transport_key(&shared_secret)?;
+        self.state.peer_keys.insert(
+            peer_id,
+            PeerKeys {
+                auth_key: SecureKey(auth_key.to_vec()),
+                transport_key: SecureKey(transport_key.to_vec()),
+            },
+        );
         Ok(())
     }
 
@@ -239,12 +294,26 @@ impl AetherEngine {
             ));
         }
 
+        let issuer_peer_id = ticket
+            .rsplit_once('.')
+            .map(|(payload, _)| payload)
+            .and_then(|payload| payload.split('|').nth(3))
+            .ok_or(AetherError::InvalidTicket)?
+            .to_string();
+        let transport_key = self
+            .state
+            .peer_keys
+            .get(&issuer_peer_id)
+            .ok_or(AetherError::PeerNotFound)?
+            .transport_key
+            .clone();
         let self_id = self.get_self_peer_id();
         self.rt.block_on(download_file_to_fd(
             peer_ip,
             peer_port,
             ticket,
             self_id,
+            transport_key,
             expected_sha256,
             resume_from,
             fd,
@@ -350,12 +419,12 @@ impl AetherEngine {
 // ── Axum handlers ─────────────────────────────────────────────────────────────
 
 async fn download_handler(
-    State(state): State<Arc<AppState>>,
+    State(state): State<ServerState>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
     // ── Rate limit ────────────────────────────────────────────────────────────
-    let _permit = match state.download_limiter.try_acquire() {
+    let _permit = match state.app.download_limiter.try_acquire() {
         Ok(p) => p,
         Err(_) => return (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response(),
     };
@@ -375,16 +444,16 @@ async fn download_handler(
         }
     };
 
-    let key_ref = match state.peer_keys.get(&peer_id) {
+    let key_ref = match state.app.peer_keys.get(&peer_id) {
         Some(k) => k,
         None => return (StatusCode::FORBIDDEN, "Unknown peer identity").into_response(),
     };
 
-    if SecurityManager::verify_ticket(&ticket_str, key_ref.value()).is_err() {
+    if SecurityManager::verify_ticket(&ticket_str, &key_ref.value().auth_key).is_err() {
         return (StatusCode::FORBIDDEN, "Invalid ticket").into_response();
     }
 
-    if let Err(e) = reject_replayed_ticket(&state.seen_tickets, &ticket_str) {
+    if let Err(e) = reject_replayed_ticket(&state.app.seen_tickets, &ticket_str) {
         tracing::warn!("Replay rejected for peer {}: {}", peer_id, e);
         return (StatusCode::FORBIDDEN, "Replay detected").into_response();
     }
@@ -399,7 +468,7 @@ async fn download_handler(
         _ => return (StatusCode::BAD_REQUEST, "Malformed ticket payload").into_response(),
     };
 
-    let allowed = match state.peer_permissions.get(&peer_id) {
+    let allowed = match state.app.peer_permissions.get(&peer_id) {
         Some(models) => models.contains(&model_id),
         None => false,
     };
@@ -412,7 +481,7 @@ async fn download_handler(
     }
 
     // ── Resolve file ──────────────────────────────────────────────────────────
-    let file_path = match state.serve_files.get(&model_id) {
+    let file_path = match state.app.serve_files.get(&model_id) {
         Some(p) => p.clone(),
         None => {
             return (StatusCode::NOT_FOUND, "No file registered for this model").into_response()
@@ -429,6 +498,7 @@ async fn download_handler(
         Ok(f) => f,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Cannot open file").into_response(),
     };
+    let transport_key = key_ref.value().transport_key.clone();
 
     // ── Range header handling ─────────────────────────────────────────────────
     let range_header = headers
@@ -449,20 +519,18 @@ async fn download_handler(
         }
 
         let content_len = file_size - start;
-        use tokio::io::AsyncSeekExt;
-        let mut seekable = file;
-        if seekable
-            .seek(std::io::SeekFrom::Start(start))
-            .await
-            .is_err()
-        {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Seek failed").into_response();
-        }
-        let stream = tokio_util::io::ReaderStream::new(seekable);
+        let stream = encrypted_file_stream(
+            file,
+            start,
+            content_len,
+            &ticket_str,
+            &transport_key,
+        );
 
         return axum::http::Response::builder()
             .status(StatusCode::PARTIAL_CONTENT)
             .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header("X-Aether-Encrypted", "chacha20")
             .header(header::CONTENT_LENGTH, content_len.to_string())
             .header(
                 "Content-Range",
@@ -473,10 +541,11 @@ async fn download_handler(
     }
 
     // ── Full file response ────────────────────────────────────────────────────
-    let stream = tokio_util::io::ReaderStream::new(file);
+    let stream = encrypted_file_stream(file, 0, file_size, &ticket_str, &transport_key);
     axum::http::Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header("X-Aether-Encrypted", "chacha20")
         .header(header::CONTENT_LENGTH, file_size.to_string())
         .body(Body::from_stream(stream))
         .unwrap()
@@ -484,6 +553,10 @@ async fn download_handler(
 
 async fn ping_handler() -> impl IntoResponse {
     (StatusCode::OK, Config::get_protocol_version())
+}
+
+async fn identity_handler(State(state): State<ServerState>) -> impl IntoResponse {
+    axum::Json((*state.identity).clone())
 }
 
 fn reject_replayed_ticket(
@@ -514,6 +587,39 @@ fn current_unix_secs() -> u64 {
         .as_secs()
 }
 
+fn encrypted_file_stream(
+    mut file: tokio::fs::File,
+    start: u64,
+    remaining_len: u64,
+    ticket: &str,
+    transport_key: &SecureKey,
+) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
+    let ticket = ticket.to_string();
+    let transport_key = transport_key.clone();
+    try_stream! {
+        let session_key = SecurityManager::derive_session_stream_key(&transport_key, &ticket)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let session_nonce = SecurityManager::derive_session_nonce(&ticket);
+        let mut cipher = ChaCha20::new((&session_key).into(), (&session_nonce).into());
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        cipher.seek(start);
+
+        let mut sent = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+        while sent < remaining_len {
+            let want = usize::try_from((remaining_len - sent).min(buf.len() as u64)).unwrap();
+            let n = file.read(&mut buf[..want]).await?;
+            if n == 0 {
+                break;
+            }
+            let mut chunk = buf[..n].to_vec();
+            cipher.apply_keystream(&mut chunk);
+            sent += n as u64;
+            yield Bytes::from(chunk);
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 #[cfg(test)]
 mod tests {
@@ -532,6 +638,15 @@ mod tests {
         let engine = AetherEngine::new();
         engine.set_self_peer_id("my-node-uuid".into());
         assert_eq!(engine.get_self_peer_id(), "my-node-uuid");
+    }
+
+    #[test]
+    fn canonicalize_json_is_sorted_and_stable() {
+        let engine = AetherEngine::new();
+        let canonical = engine
+            .canonicalize_json(r#"{"z":"last","a":"first","full":{"url":"x","size":1}}"#.into())
+            .unwrap();
+        assert_eq!(canonical, r#"{"a":"first","full":{"size":1,"url":"x"},"z":"last"}"#);
     }
 
     #[test]
@@ -605,7 +720,8 @@ mod tests {
         let raw = vec![0x11u8; 32];
         let derived = SecurityManager::derive_hmac_key(&raw).unwrap();
         let ticket =
-            SecurityManager::generate_ticket("m", "1", &SecureKey(derived.to_vec())).unwrap();
+            SecurityManager::generate_ticket("m", "1", "seeder-1", &SecureKey(derived.to_vec()))
+                .unwrap();
         let seen = DashMap::new();
 
         assert!(reject_replayed_ticket(&seen, &ticket).is_ok());

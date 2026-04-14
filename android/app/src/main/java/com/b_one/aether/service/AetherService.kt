@@ -16,12 +16,16 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.b_one.aether.MainActivity
 import com.b_one.aether.R
+import com.b_one.aether.security.PeerPin
+import com.b_one.aether.security.PeerPinStore
+import com.b_one.aether.security.PeerTrust
 import com.b_one.aether.security.SecureVault
-import com.b_one.aether.util.CanonicalJson
 import kotlinx.coroutines.*
 import org.json.JSONObject
 import uniffi.aether_core.AetherEngine
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import java.security.MessageDigest
 
 /**
@@ -35,6 +39,8 @@ import java.security.MessageDigest
  *  • decompress() exposed for post-download zstd inflation.
  */
 class AetherService : Service() {
+
+    data class SeederGrant(val peerId: String, val modelId: String)
 
     companion object {
         private const val TAG              = "AetherService"
@@ -50,6 +56,9 @@ class AetherService : Service() {
 
     private val scope        = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val rustEngine: AetherEngine by lazy { AetherEngine() }
+    private val peerPinStore by lazy { PeerPinStore(applicationContext) }
+
+    private val protocolVersion = "v2.3-swarm-fixed"
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -60,6 +69,7 @@ class AetherService : Service() {
 
         // Use a fingerprint of the hardware-backed identity key, not ANDROID_ID.
         rustEngine.setSelfPeerId(getStablePeerId())
+        rustEngine.setSelfIdentityPublicKey(SecureVault.getPublicKeyX962Bytes())
 
         startRustServer()
         startHeartbeat()
@@ -81,18 +91,23 @@ class AetherService : Service() {
     private fun startRustServer() {
         scope.launch {
             try {
-                val port = rustEngine.startServer()
-                Log.i(TAG, "✅ Swarm node active on :$port")
-                updateNotification("Aether node active on :$port")
-                sendBroadcast(Intent(ACTION_SERVER_STARTED).apply {
-                    putExtra(EXTRA_PORT, port.toInt())
-                    setPackage(packageName)
-                })
+                startRustServerInternal()
             } catch (e: Exception) {
                 Log.e(TAG, "❌ CRITICAL – Rust core failed to start", e)
                 stopSelf()
             }
         }
+    }
+
+    private fun startRustServerInternal(): UShort {
+        val port = rustEngine.startServer()
+        Log.i(TAG, "✅ Swarm node active on :$port")
+        updateNotification("Aether node active on :$port")
+        sendBroadcast(Intent(ACTION_SERVER_STARTED).apply {
+            putExtra(EXTRA_PORT, port.toInt())
+            setPackage(packageName)
+        })
+        return port
     }
 
     // ── Zero-Copy Download ────────────────────────────────────────────────────
@@ -227,7 +242,7 @@ class AetherService : Service() {
                 val signatureHex = manifest.getString("signature")
 
                 // Reconstruct canonical JSON (sorted keys, no whitespace)
-                val canonicalJson = CanonicalJson.fromJsonObject(payload)
+                val canonicalJson = rustEngine.canonicalizeJson(payload.toString())
 
                 val signatureValid = SecureVault.verifyManifestSignature(
                     canonicalJson  = canonicalJson,
@@ -397,5 +412,132 @@ class AetherService : Service() {
                 onError?.invoke(e)
             }
         }
+    }
+
+    /**
+     * Seeder-safe startup entrypoint:
+     *  1. stop existing server,
+     *  2. register file,
+     *  3. grant peer permissions,
+     *  4. start server and broadcast only after all state is ready.
+     */
+    fun startSeederNode(
+        modelId: String,
+        filePath: String,
+        grants: List<SeederGrant> = emptyList(),
+        onSuccess: ((port: Int) -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ): Job {
+        return scope.launch {
+            try {
+                rustEngine.stopServer()
+                delay(250)
+
+                rustEngine.registerFileForServing(modelId = modelId, filePath = filePath)
+                grants.forEach { grant ->
+                    rustEngine.grantPeerModelAccess(peerId = grant.peerId, modelId = grant.modelId)
+                }
+
+                val port = startRustServerInternal()
+                Log.i(TAG, "✅ Seeder node ready for $modelId on :$port")
+                onSuccess?.invoke(port.toInt())
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ startSeederNode failed", e)
+                onError?.invoke(e)
+            }
+        }
+    }
+
+    fun performAuthenticatedHandshake(
+        peerIp: String,
+        peerPort: Int,
+        expectedPeerId: String? = null,
+        expectedPeerPublicKeySha256: String? = null,
+        trustOnFirstUse: Boolean = true,
+        onSuccess: ((peerId: String, publicKeySha256: String, trustEstablishedNow: Boolean) -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ): Job {
+        return scope.launch {
+            try {
+                val conn = (URL("http://$peerIp:$peerPort/identity").openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 5_000
+                    readTimeout = 5_000
+                }
+                conn.inputStream.bufferedReader().use { reader ->
+                    val doc = JSONObject(reader.readText())
+                    val peerId = doc.getString("peer_id")
+                    val publicKeyHex = doc.getString("public_key_hex")
+                    val peerProtocolVersion = doc.optString("protocol_version", protocolVersion)
+                    require(publicKeyHex.isNotBlank()) { "Peer did not publish an identity key" }
+
+                    if (expectedPeerId != null) {
+                        require(peerId == expectedPeerId) { "Peer ID mismatch" }
+                    }
+
+                    val publicKeyBytes = PeerTrust.hexToBytes(publicKeyHex)
+                    val fingerprint = PeerTrust.fingerprintHex(publicKeyBytes)
+                    if (expectedPeerPublicKeySha256 != null) {
+                        require(fingerprint == expectedPeerPublicKeySha256) { "Peer public key fingerprint mismatch" }
+                    }
+
+                    val trustDecision = PeerTrust.evaluateHandshake(
+                        peerId = peerId,
+                        publicKeyHex = publicKeyHex,
+                        protocolVersion = peerProtocolVersion,
+                        existingPin = peerPinStore.get(peerId),
+                        trustOnFirstUse = trustOnFirstUse
+                    )
+
+                    val sharedSecret = SecureVault.performHandshake(publicKeyBytes)
+                    rustEngine.registerPeerKey(peerId = peerId, sharedSecret = sharedSecret)
+                    peerPinStore.save(trustDecision.pin)
+                    Log.i(TAG, "✅ Authenticated handshake complete with $peerId")
+                    onSuccess?.invoke(peerId, fingerprint, trustDecision.trustEstablishedNow)
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Authenticated handshake failed", e)
+                onError?.invoke(e)
+            }
+        }
+    }
+
+    fun exportSelfPeerOnboardingPayload(): String =
+        PeerTrust.createOnboardingPayload(
+            peerId = getStablePeerId(),
+            publicKeyHex = SecureVault.getPublicKeyX962Bytes().joinToString("") { "%02x".format(it) },
+            protocolVersion = protocolVersion
+        )
+
+    fun exportSelfPeerOnboardingUri(): String =
+        PeerTrust.createOnboardingUri(
+            peerId = getStablePeerId(),
+            publicKeyHex = SecureVault.getPublicKeyX962Bytes().joinToString("") { "%02x".format(it) },
+            protocolVersion = protocolVersion
+        )
+
+    fun importPeerPinFromOnboardingPayload(
+        payloadOrUri: String,
+        onSuccess: ((PeerPin) -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ): Job {
+        return scope.launch {
+            try {
+                val pin = PeerTrust.parseOnboardingPayload(payloadOrUri)
+                peerPinStore.save(pin)
+                Log.i(TAG, "✅ Imported pinned peer ${pin.peerId} via onboarding payload")
+                onSuccess?.invoke(pin)
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Failed to import peer pin", e)
+                onError?.invoke(e)
+            }
+        }
+
+    }
+
+    fun getPinnedPeer(peerId: String): PeerPin? = peerPinStore.get(peerId)
+
+    fun removePinnedPeer(peerId: String) {
+        peerPinStore.remove(peerId)
     }
 }

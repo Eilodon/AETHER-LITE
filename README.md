@@ -8,7 +8,7 @@
 
 Transfer a 10 GB AI model to a device with 512 MB RAM. Resume after network loss. Apply a 50 MB patch instead of re-downloading 1 GB. All verified with SHA-256. All authenticated with HMAC-SHA256 backed by hardware security chips.
 
-Current threat model: integrity checks are mandatory and enforced in Rust, but authenticated key exchange and peer discovery still belong to the embedding app. The built-in transport is plaintext HTTP and is only appropriate on trusted LANs unless you add TLS/Noise above it.
+Current threat model: integrity checks are mandatory and enforced in Rust. The mobile SDK now supports peer-pin persistence, TOFU-first handshake, and QR payload onboarding for authenticated ECDH, but discovery and camera/UI orchestration still belong to the embedding app. File bytes are session-encrypted after handshake, but HTTP metadata and control flow remain visible on the LAN unless you add TLS/Noise above it.
 
 ---
 
@@ -249,22 +249,29 @@ try await AetherManager.shared.applySmartPatch(
 ## Protocol Flow
 
 ```
-Peer A (Seeder)                        Peer B (Leecher)
-───────────────                        ────────────────
+Peer A (Seeder)                             Peer B (Leecher)
+───────────────                             ────────────────
 start_server() → :port
-                  ── discovery / rendezvous supplied by app layer ──→
-exchange ECDH public keys through an authenticated out-of-band channel
-performHandshake(pubB) → secret        performHandshake(pubA) → secret
-registerPeerKey(uuid_B, shared_secret) registerPeerKey(uuid_A, shared_secret)
-grantPeerModelAccess(uuid_B, model)    grantPeerModelAccess(uuid_A, model)
+exportSelfPeerOnboardingURI()
+        ── QR / deep-link / share sheet ──→ importPeerPin(onboardingURI)
+
+or, if no QR step is available yet:
+        ───────────── trusted first contact over LAN ─────────────→
+        performAuthenticatedHandshake(..., trustOnFirstUse = true)
+        store TOFU pin locally for future sessions
+
+performAuthenticatedHandshake(..., trustOnFirstUse = false) on later sessions
+fetch /identity → verify stored peer pin → ECDH → registerPeerKey()
+grantPeerModelAccess(uuid_B, model)         registerPeerKey(uuid_A, shared_secret)
 register_file_for_serving(model_id, path)
 
-                  ←── GET /download?pid=B ───
-                       X-Aether-Auth: ticket
+                       ←── GET /download?pid=B ───
+                            X-Aether-Auth: ticket
 verify_ticket() ✓
-                  ──── 206 / 200 stream ────→
-                       [socket → kernel → fd → disk]
-                       [SHA-256 verified inline]
+                       ──── 206 / 200 stream ────→
+                            [socket → kernel → fd → disk]
+                            [transport key stream-encrypted]
+                            [SHA-256 verified inline]
 
 Admin:  forge publish → patch.bin + manifest.json (ECDSA signed)
 Peer B: download patch + manifest
