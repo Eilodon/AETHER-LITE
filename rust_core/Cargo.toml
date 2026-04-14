@@ -1,0 +1,64 @@
+# rust_core/Cargo.toml
+[package]
+name    = "aether_core"
+version = "2.3.2"
+edition = "2021"
+description = "Aether Suite – P2P zero-copy transfer, surgical patching, manifest verification"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+name = "aether_core"
+
+[dependencies]
+# --- ASYNC RUNTIME ---
+tokio      = { version = "1.36", features = ["rt", "rt-multi-thread", "macros", "net", "sync", "fs", "io-util", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }   # ReaderStream for seeder file streaming
+
+# --- WEB SERVER ---
+axum       = { version = "0.7", features = ["http1", "query"] }
+tower      = { version = "0.4", features = ["util", "limit"] }
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+
+# --- SECURITY & CRYPTO ---
+ring    = "0.17"        # ECDSA verify + SHA-256
+hmac    = "0.12"
+hkdf    = "0.12"        # HKDF-SHA256 for key derivation from ECDH shared secret
+sha2    = "0.10"
+hex     = "0.4"
+base64  = "0.21"
+zeroize = { version = "1.7", features = ["derive"] }
+
+# --- UTILITIES ---
+serde       = { version = "1.0", features = ["derive"] }
+serde_json  = "1.0"
+thiserror   = "1.0"
+dashmap     = "5.5"
+tracing     = "0.1"
+tracing-subscriber = "0.3"
+uuid        = { version = "1.7", features = ["v4", "fast-rng"] }
+
+# --- COMPRESSION & PATCHING ---
+zstd    = "0.13"
+qbsdiff = "1.4"
+
+# --- BRIDGE ---
+uniffi = { version = "0.26", features = ["tokio"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+tracing-android = "0.2"
+
+[build-dependencies]
+uniffi = { version = "0.26", features = ["build"] }
+
+[profile.release]
+opt-level     = "z"
+lto           = true
+codegen-units = 1
+panic         = "abort"
+strip         = true
+
+[dev-dependencies]
+tempfile           = "3.10"        # Temp files for unit tests
+
+[profile.dev]
+opt-level = 1

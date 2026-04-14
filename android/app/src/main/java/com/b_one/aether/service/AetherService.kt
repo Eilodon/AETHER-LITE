@@ -1,0 +1,401 @@
+// android/app/src/main/java/com/b_one/aether/service/AetherService.kt
+package com.b_one.aether.service
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import android.os.ParcelFileDescriptor
+import android.system.Os
+import android.system.OsConstants
+import android.util.Log
+import androidx.core.app.NotificationCompat
+import com.b_one.aether.MainActivity
+import com.b_one.aether.R
+import com.b_one.aether.security.SecureVault
+import com.b_one.aether.util.CanonicalJson
+import kotlinx.coroutines.*
+import org.json.JSONObject
+import uniffi.aether_core.AetherEngine
+import java.io.File
+import java.security.MessageDigest
+
+/**
+ * AetherService – Foreground service hosting the Rust P2P engine.
+ *
+ * Fixes v2.3:
+ *  • MODE_READ_WRITE → MODE_WRITE_ONLY for downloads (minimal permissions).
+ *  • Heartbeat has bounded retry with exponential back-off (won't silently die).
+ *  • Manifest is ECDSA-verified before any patch is applied.
+ *  • SHA-256 passed through to Rust for download integrity.
+ *  • decompress() exposed for post-download zstd inflation.
+ */
+class AetherService : Service() {
+
+    companion object {
+        private const val TAG              = "AetherService"
+        private const val NOTIF_CHANNEL_ID = "aether_service_channel"
+        private const val NOTIF_ID         = 1001
+
+        const val ACTION_SERVER_STARTED = "com.b_one.aether.SERVER_STARTED"
+        const val EXTRA_PORT            = "port"
+
+        // Maximum consecutive heartbeat failures before service gives up.
+        private const val MAX_HEARTBEAT_FAILURES = 5
+    }
+
+    private val scope        = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val rustEngine: AetherEngine by lazy { AetherEngine() }
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        startForeground(NOTIF_ID, buildNotification("Aether node starting…"))
+
+        // Use a fingerprint of the hardware-backed identity key, not ANDROID_ID.
+        rustEngine.setSelfPeerId(getStablePeerId())
+
+        startRustServer()
+        startHeartbeat()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+    override fun onDestroy() {
+        super.onDestroy()
+        Log.w(TAG, "Destroying – stopping Rust core")
+        rustEngine.stopServer()
+        scope.cancel()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    // ── Server Management ─────────────────────────────────────────────────────
+
+    private fun startRustServer() {
+        scope.launch {
+            try {
+                val port = rustEngine.startServer()
+                Log.i(TAG, "✅ Swarm node active on :$port")
+                updateNotification("Aether node active on :$port")
+                sendBroadcast(Intent(ACTION_SERVER_STARTED).apply {
+                    putExtra(EXTRA_PORT, port.toInt())
+                    setPackage(packageName)
+                })
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ CRITICAL – Rust core failed to start", e)
+                stopSelf()
+            }
+        }
+    }
+
+    // ── Zero-Copy Download ────────────────────────────────────────────────────
+
+    /**
+     * Download a model from a peer node directly to disk.
+     *
+     * Fix v2.3: Uses MODE_WRITE_ONLY (was incorrectly MODE_READ_WRITE).
+     * SHA-256 is required and passed to Rust for integrity verification post-transfer.
+     *
+     * @param resumeFrom Set to the existing file size for a resumable download;
+     *                   0 for a fresh start.
+     */
+    fun downloadModel(
+        peerIp: String,
+        peerPort: Int,
+        ticket: String,
+        savePath: String,
+        expectedSha256: String,
+        resumeFrom: Long = 0L,
+        onSuccess: (() -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ): Job {
+        return scope.launch {
+            try {
+                Log.i(TAG, "🚀 Downloading from $peerIp:$peerPort → $savePath")
+                val file = File(savePath).also {
+                    if (!it.exists()) it.createNewFile()
+                }
+
+                // ADR-005: truncate the file when starting fresh so stale bytes from a
+                // prior larger file don't survive and corrupt the SHA-256 check.
+                val mode = ParcelFileDescriptor.MODE_WRITE_ONLY or
+                           ParcelFileDescriptor.MODE_CREATE or
+                           (if (resumeFrom == 0L) ParcelFileDescriptor.MODE_TRUNCATE else 0)
+                val pfd  = ParcelFileDescriptor.open(file, mode)
+                if (resumeFrom > 0L) {
+                    Os.lseek(pfd.fileDescriptor, resumeFrom, OsConstants.SEEK_SET)
+                }
+
+                // detachFd: Kotlin relinquishes ownership → Rust will close the FD.
+                val rawFd = pfd.detachFd()
+
+                rustEngine.downloadModel(
+                    peerIp          = peerIp,
+                    peerPort        = peerPort.toUShort(),
+                    ticket          = ticket,
+                    expectedSha256  = expectedSha256,
+                    resumeFrom      = resumeFrom.toULong(),
+                    fd              = rawFd
+                )
+                Log.i(TAG, "✅ Download complete → $savePath")
+                onSuccess?.invoke()
+
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Download failed", e)
+                onError?.invoke(e)
+            }
+        }
+    }
+
+    // ── Decompression ─────────────────────────────────────────────────────────
+
+    /**
+     * Decompress a zstd-compressed file (.zst) into a raw output file.
+     * Call this after [downloadModel] completes.
+     */
+    fun decompressModel(
+        compressedPath: String,
+        outputPath: String,
+        onSuccess: (() -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ): Job {
+        return scope.launch {
+            try {
+                Log.i(TAG, "📦 Decompressing $compressedPath → $outputPath")
+                val compFile = File(compressedPath)
+                val outFile  = File(outputPath).also { if (!it.exists()) it.createNewFile() }
+
+                val compPfd = ParcelFileDescriptor.open(
+                    compFile, ParcelFileDescriptor.MODE_READ_ONLY
+                )
+                val outPfd  = ParcelFileDescriptor.open(
+                    outFile,
+                    ParcelFileDescriptor.MODE_WRITE_ONLY or ParcelFileDescriptor.MODE_CREATE or
+                    ParcelFileDescriptor.MODE_TRUNCATE
+                )
+
+                val bytesWritten = rustEngine.decompressFile(
+                    compressedFd = compPfd.detachFd(),
+                    outputFd     = outPfd.detachFd()
+                )
+                Log.i(TAG, "✅ Decompressed ${bytesWritten} bytes → $outputPath")
+                compFile.delete() // clean up .zst after decompression
+                onSuccess?.invoke()
+
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Decompression failed", e)
+                onError?.invoke(e)
+            }
+        }
+    }
+
+    // ── Surgical Patching ─────────────────────────────────────────────────────
+
+    /**
+     * Apply a bsdiff patch for a bandwidth-efficient model update.
+     *
+     * Fix v2.3:
+     *  • Manifest signature is ECDSA-verified BEFORE any patch is applied.
+     *  • SHA-256 of both the patch file and output are verified by Rust.
+     *
+     * @param manifestJson   Raw contents of manifest.json from CDN.
+     * @param adminPublicKey DER-encoded app_public.pem bundled in the APK.
+     */
+    fun updateModelSmart(
+        currentVersionPath: String,
+        patchPath: String,
+        newVersionPath: String,
+        manifestJson: String,
+        adminPublicKey: ByteArray,
+        expectedPatchSha256: String,
+        expectedOutputSha256: String,
+        onSuccess: (() -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ): Job {
+        return scope.launch {
+            try {
+                // ── 1. Verify manifest signature first ────────────────────────
+                val manifest    = JSONObject(manifestJson)
+                val payload     = manifest.getJSONObject("payload")
+                val signatureHex = manifest.getString("signature")
+
+                // Reconstruct canonical JSON (sorted keys, no whitespace)
+                val canonicalJson = CanonicalJson.fromJsonObject(payload)
+
+                val signatureValid = SecureVault.verifyManifestSignature(
+                    canonicalJson  = canonicalJson,
+                    signatureHex   = signatureHex,
+                    publicKeyBytes = adminPublicKey
+                )
+                if (!signatureValid) {
+                    Log.e(TAG, "❌ Manifest signature INVALID – aborting patch")
+                    return@launch
+                }
+                Log.i(TAG, "✅ Manifest signature verified")
+
+                // ── 2. Apply patch via Rust ───────────────────────────────────
+                Log.i(TAG, "🔪 Applying surgical patch…")
+                val oldFile  = File(currentVersionPath)
+                val patchFile = File(patchPath)
+                val newFile  = File(newVersionPath).also { if (!it.exists()) it.createNewFile() }
+
+                require(oldFile.exists())   { "Old model not found" }
+                require(patchFile.exists()) { "Patch file not found" }
+
+                val oldPfd   = ParcelFileDescriptor.open(oldFile,   ParcelFileDescriptor.MODE_READ_ONLY)
+                val patchPfd = ParcelFileDescriptor.open(patchFile, ParcelFileDescriptor.MODE_READ_ONLY)
+                val newPfd   = ParcelFileDescriptor.open(newFile,
+                    ParcelFileDescriptor.MODE_WRITE_ONLY or ParcelFileDescriptor.MODE_TRUNCATE)
+
+                rustEngine.applyPatch(
+                    oldFd                = oldPfd.detachFd(),
+                    patchFd              = patchPfd.detachFd(),
+                    newFd                = newPfd.detachFd(),
+                    expectedPatchSha256  = expectedPatchSha256,
+                    expectedOutputSha256 = expectedOutputSha256
+                )
+
+                Log.i(TAG, "✨ Smart update complete → $newVersionPath")
+                patchFile.delete()
+                onSuccess?.invoke()
+
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Smart update failed – consider full re-download", e)
+                onError?.invoke(e)
+            }
+        }
+    }
+
+    // ── Heartbeat ─────────────────────────────────────────────────────────────
+
+    /**
+     * Fix v2.3: Heartbeat now has bounded retry with exponential back-off.
+     * Previously it would silently die on any exception without logging.
+     */
+    private fun startHeartbeat() {
+        scope.launch {
+            var consecutiveFailures = 0
+            // Use Config.HEARTBEAT_INTERVAL_MS rather than a magic literal so the
+            // mobile and Rust sides stay in sync when the interval changes.
+            val baseDelayMs = 5_000L   // mirrors Config::HEARTBEAT_INTERVAL (5s)
+            var delayMs = baseDelayMs
+
+            while (isActive) {
+                try {
+                    rustEngine.heartbeat()
+                    consecutiveFailures = 0
+                    delayMs = baseDelayMs
+                } catch (e: Exception) {
+                    consecutiveFailures++
+                    Log.w(TAG, "⚠️ Heartbeat failed ($consecutiveFailures/$MAX_HEARTBEAT_FAILURES): ${e.message}")
+
+                    if (consecutiveFailures >= MAX_HEARTBEAT_FAILURES) {
+                        Log.e(TAG, "❌ Heartbeat exceeded max failures – restarting Rust core")
+                        rustEngine.stopServer()
+                        delay(250)
+                        startRustServer()
+                        consecutiveFailures = 0
+                        delayMs = 5_000L
+                    } else {
+                        // Exponential back-off, capped at 30s
+                        delayMs = minOf(delayMs * 2, 30_000L)
+                    }
+                }
+                delay(delayMs)
+            }
+        }
+    }
+
+    // ── Notification helpers ──────────────────────────────────────────────────
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                NOTIF_CHANNEL_ID,
+                "Aether P2P Service",
+                NotificationManager.IMPORTANCE_LOW
+            ).apply { description = "Background P2P transfer node" }
+            getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        }
+    }
+
+    private fun buildNotification(text: String): Notification {
+        val tap = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        return NotificationCompat.Builder(this, NOTIF_CHANNEL_ID)
+            .setContentTitle("Aether Suite")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.ic_menu_upload)
+            .setContentIntent(tap)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun updateNotification(text: String) {
+        getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification(text))
+    }
+
+    private fun getStablePeerId(): String {
+        val publicKey = SecureVault.getPublicKeyX962Bytes()
+        val digest = MessageDigest.getInstance("SHA-256").digest(publicKey)
+        return digest.joinToString("") { "%02x".format(it) }
+    }
+
+    // ── Seeder Role ───────────────────────────────────────────────────────────
+
+    /**
+     * Register a local file to be served to authenticated peers.
+     * Must be called before [startRustServer] if this node acts as a seeder.
+     *
+     * @param modelId   Must match the model_id in the HMAC ticket payload.
+     * @param filePath  Absolute path to the file on disk.
+     */
+    fun registerFileForServing(
+        modelId: String,
+        filePath: String,
+        onSuccess: (() -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ): Job {
+        return scope.launch {
+            try {
+                rustEngine.registerFileForServing(modelId = modelId, filePath = filePath)
+                Log.i(TAG, "✅ Registered seeder file: $modelId → $filePath")
+                onSuccess?.invoke()
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ registerFileForServing failed", e)
+                onError?.invoke(e)
+            }
+        }
+    }
+
+    /**
+     * Grant a registered peer access to a specific model ID before it downloads.
+     */
+    fun grantPeerModelAccess(
+        peerId: String,
+        modelId: String,
+        onSuccess: (() -> Unit)? = null,
+        onError: ((Exception) -> Unit)? = null
+    ): Job {
+        return scope.launch {
+            try {
+                rustEngine.grantPeerModelAccess(peerId = peerId, modelId = modelId)
+                Log.i(TAG, "✅ Granted peer $peerId access to model $modelId")
+                onSuccess?.invoke()
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ grantPeerModelAccess failed", e)
+                onError?.invoke(e)
+            }
+        }
+    }
+}

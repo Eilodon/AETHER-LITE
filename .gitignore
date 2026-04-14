@@ -1,0 +1,39 @@
+# Rust
+/rust_core/target/
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.so
+*.iml
+.idea/
+
+# iOS
+ios/DerivedData/
+ios/*.xcuserstate
+ios/Pods/
+*.a
+
+# UniFFI generated (re-generated on build — do NOT commit)
+ios/AetherApp/AetherCore/aetherFFI.h
+ios/AetherApp/AetherCore/aetherFFI.swift
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+tools/.venv/
+tools/venv/
+tools/dist/
+tools/.coverage
+
+# Admin keys — NEVER commit the private key
+tools/keys/admin_private.pem
+keys/admin_private.pem
+
+# Editor
+.vscode/
+*.swp
+.DS_Store

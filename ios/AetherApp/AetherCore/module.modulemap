@@ -1,0 +1,15 @@
+// ios/AetherApp/AetherCore/module.modulemap
+//
+// Swift uses this module map to import the C header that UniFFI generates.
+//
+// Setup steps:
+//  1. Run `cargo build --release --target aarch64-apple-ios` in rust_core/.
+//  2. Copy the generated `libaether_core.a` and `aetherFFI.h` into this folder.
+//  3. In Xcode: Build Settings → "Swift Compiler – Search Paths"
+//     → "Import Paths" → add the path containing this module.modulemap.
+//  4. In Xcode: Build Phases → "Link Binary With Libraries" → add libaether_core.a.
+
+module AetherFFI {
+    header "aetherFFI.h"
+    export *
+}

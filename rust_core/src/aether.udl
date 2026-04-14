@@ -1,0 +1,73 @@
+namespace aether_core {};
+
+[Error]
+enum AetherError {
+    "ServerStartupError",
+    "NetworkError",
+    "SecurityError",
+    "InvalidTicket",
+    "KeyExchangeFailed",
+    "PeerNotFound",
+    "PatchError",
+    "ChecksumMismatch",
+    "DecompressError",
+    "SignatureVerificationFailed",
+    "DownloadIncomplete",
+    "RateLimitExceeded",
+    "InternalError"
+};
+
+interface AetherEngine {
+    constructor();
+
+    void set_self_peer_id(string peer_id);
+
+    [Throws=AetherError]
+    u16 start_server();
+
+    void stop_server();
+
+    [Throws=AetherError]
+    void register_peer_key(string peer_id, bytes shared_secret);
+
+    [Throws=AetherError]
+    void grant_peer_model_access(string peer_id, string model_id);
+
+    [Throws=AetherError]
+    void register_file_for_serving(string model_id, string file_path);
+
+    [Throws=AetherError]
+    void download_model(
+        string peer_ip,
+        u16 peer_port,
+        string ticket,
+        string expected_sha256,
+        u64 resume_from,
+        i32 fd
+    );
+
+    [Throws=AetherError]
+    void apply_patch(
+        i32 old_fd,
+        i32 patch_fd,
+        i32 new_fd,
+        string expected_patch_sha256,
+        string expected_output_sha256
+    );
+
+    [Throws=AetherError]
+    u64 decompress_file(i32 compressed_fd, i32 output_fd);
+
+    [Throws=AetherError]
+    boolean verify_manifest(
+        string canonical_json,
+        string sig_hex,
+        bytes public_key_der
+    );
+
+    [Throws=AetherError]
+    void heartbeat();
+
+    [Throws=AetherError]
+    boolean ping_peer(string peer_ip, u16 peer_port);
+};
