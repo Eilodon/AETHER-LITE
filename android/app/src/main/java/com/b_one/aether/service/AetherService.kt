@@ -58,7 +58,8 @@ class AetherService : Service() {
     private val rustEngine: AetherEngine by lazy { AetherEngine() }
     private val peerPinStore by lazy { PeerPinStore(applicationContext) }
 
-    private val protocolVersion = "v2.3-swarm-fixed"
+    // ADR-010: single source of truth — query from Rust config instead of hardcoding
+    private val protocolVersion: String by lazy { rustEngine.getProtocolVersion() }
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -124,6 +125,7 @@ class AetherService : Service() {
     fun downloadModel(
         peerIp: String,
         peerPort: Int,
+        seederPeerId: String,
         ticket: String,
         savePath: String,
         expectedSha256: String,
@@ -154,6 +156,7 @@ class AetherService : Service() {
                 rustEngine.downloadModel(
                     peerIp          = peerIp,
                     peerPort        = peerPort.toUShort(),
+                    seederPeerId    = seederPeerId,
                     ticket          = ticket,
                     expectedSha256  = expectedSha256,
                     resumeFrom      = resumeFrom.toULong(),
@@ -375,6 +378,11 @@ class AetherService : Service() {
      * @param modelId   Must match the model_id in the HMAC ticket payload.
      * @param filePath  Absolute path to the file on disk.
      */
+    @Deprecated(
+        message = "Calling this standalone method alongside startRustServer() is racy. " +
+                "Use startSeederNode() instead, which runs all setup sequentially.",
+        replaceWith = ReplaceWith("startSeederNode(modelId, filePath, grants)")
+    )
     fun registerFileForServing(
         modelId: String,
         filePath: String,
@@ -396,6 +404,11 @@ class AetherService : Service() {
     /**
      * Grant a registered peer access to a specific model ID before it downloads.
      */
+    @Deprecated(
+        message = "Calling this standalone method alongside startRustServer() is racy. " +
+                "Use startSeederNode() with grants parameter instead.",
+        replaceWith = ReplaceWith("startSeederNode(modelId, filePath, grants)")
+    )
     fun grantPeerModelAccess(
         peerId: String,
         modelId: String,
@@ -430,8 +443,11 @@ class AetherService : Service() {
     ): Job {
         return scope.launch {
             try {
-                rustEngine.stopServer()
-                delay(250)
+                // ADR-007: guard — only stop if server is actually running
+                if (rustEngine.isServerRunning()) {
+                    rustEngine.stopServer()
+                    delay(250)  // wait for TCP socket release
+                }
 
                 rustEngine.registerFileForServing(modelId = modelId, filePath = filePath)
                 grants.forEach { grant ->
@@ -468,7 +484,9 @@ class AetherService : Service() {
                     val doc = JSONObject(reader.readText())
                     val peerId = doc.getString("peer_id")
                     val publicKeyHex = doc.getString("public_key_hex")
-                    val peerProtocolVersion = doc.optString("protocol_version", protocolVersion)
+                    val peerProtocolVersion = doc.optString("protocol_version", "")
+                    // ADR-010: centralized validation in Rust — rejects blank or incompatible version
+                    rustEngine.validatePeerProtocol(peerProtocolVersion)
                     require(publicKeyHex.isNotBlank()) { "Peer did not publish an identity key" }
 
                     if (expectedPeerId != null) {
@@ -539,5 +557,8 @@ class AetherService : Service() {
 
     fun removePinnedPeer(peerId: String) {
         peerPinStore.remove(peerId)
+        // ADR-011: also revoke in Rust engine so the peer cannot download
+        // in the current session (previously only cleared persistent storage).
+        try { rustEngine.revokePeer(peerId) } catch (_: Exception) {}
     }
 }

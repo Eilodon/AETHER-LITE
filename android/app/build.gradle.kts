@@ -75,6 +75,9 @@ dependencies {
     // JNA – required by UniFFI on Android
     implementation("net.java.dev.jna:jna:5.14.0@aar")
 
+    // ADR-008: EncryptedSharedPreferences for peer pin storage
+    implementation("androidx.security:security-crypto:1.1.0-alpha06")
+
     // Testing
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

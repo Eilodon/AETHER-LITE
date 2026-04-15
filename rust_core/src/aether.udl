@@ -30,11 +30,21 @@ interface AetherEngine {
 
     void stop_server();
 
+    boolean is_server_running();
+
+    string get_protocol_version();
+
+    [Throws=AetherError]
+    void validate_peer_protocol(string peer_version);
+
     [Throws=AetherError]
     void register_peer_key(string peer_id, bytes shared_secret);
 
     [Throws=AetherError]
     void grant_peer_model_access(string peer_id, string model_id);
+
+    [Throws=AetherError]
+    void revoke_peer(string peer_id);
 
     [Throws=AetherError]
     void register_file_for_serving(string model_id, string file_path);
@@ -43,6 +53,7 @@ interface AetherEngine {
     void download_model(
         string peer_ip,
         u16 peer_port,
+        string seeder_peer_id,
         string ticket,
         string expected_sha256,
         u64 resume_from,

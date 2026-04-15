@@ -28,7 +28,8 @@ final class AetherManager: ObservableObject {
     private let monitorQ   = DispatchQueue(label: "com.b_one.aether.network")
     private var heartbeatTask: Task<Void, Never>?
     private let peerPinStore = PeerPinStore()
-    private let protocolVersion = "v2.3-swarm-fixed"
+    // ADR-010: single source of truth — query from Rust config instead of hardcoding
+    private lazy var protocolVersion: String = { engine?.getProtocolVersion() ?? "v2" }()
 
     private static let MAX_HEARTBEAT_FAILURES = 5
 
@@ -40,7 +41,7 @@ final class AetherManager: ObservableObject {
 
             eng.setSelfPeerId(peerId: self.getStablePeerId())
             if let publicKey = Vault.shared.getPublicKeyData() {
-                try? eng.setSelfIdentityPublicKey(publicKeyX962: [UInt8](publicKey))
+                try eng.setSelfIdentityPublicKey(publicKeyX962: [UInt8](publicKey))
             }
 
             await MainActor.run {
@@ -116,7 +117,9 @@ final class AetherManager: ObservableObject {
         else {
             throw AetherError.InternalError("Peer identity document invalid")
         }
-        let peerProtocolVersion = (doc?["protocol_version"] as? String) ?? protocolVersion
+        let peerProtocolVersion = (doc?["protocol_version"] as? String) ?? ""
+        // ADR-010: centralized validation in Rust — rejects blank or incompatible version
+        try engine?.validatePeerProtocol(peerVersion: peerProtocolVersion)
 
         if let expectedPeerId, expectedPeerId != peerId {
             throw AetherError.SecurityError("Peer ID mismatch")
@@ -178,6 +181,9 @@ final class AetherManager: ObservableObject {
 
     func removePinnedPeer(peerId: String) {
         peerPinStore.remove(peerId: peerId)
+        // ADR-011: also revoke in Rust engine so the peer cannot download
+        // in the current session (previously only cleared persistent storage).
+        try? engine?.revokePeer(peerId: peerId)
     }
 
     // ── Zero-Copy Download ─────────────────────────────────────────────────────
@@ -194,6 +200,7 @@ final class AetherManager: ObservableObject {
     func downloadModel(
         peerIp: String,
         peerPort: UInt16,
+        seederPeerId: String,
         ticket: String,
         destUrl: URL,
         expectedSha256: String,
@@ -228,6 +235,7 @@ final class AetherManager: ObservableObject {
             try engine.downloadModel(
                 peerIp:         peerIp,
                 peerPort:       peerPort,
+                seederPeerId:   seederPeerId,
                 ticket:         ticket,
                 expectedSha256: expectedSha256,
                 resumeFrom:     resumeFrom,
@@ -409,7 +417,10 @@ final class AetherManager: ObservableObject {
     }
 
     private func restartNode() {
-        engine?.stopServer()
+        // ADR-007: guard — only stop if server is actually running
+        if engine?.isServerRunning() == true {
+            engine?.stopServer()
+        }
         isNodeActive = false
         activePort = 0
 

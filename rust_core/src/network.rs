@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 /// arrived in the same read(s) as the headers.
 struct HttpResponse {
     content_length: Option<u64>,
+    nonce_hex: Option<String>,
     body_prefix: Vec<u8>,
 }
 
@@ -91,8 +92,16 @@ async fn read_http_response(stream: &mut TcpStream) -> Result<HttpResponse, Aeth
                 .and_then(|l| l.split_once(':').map(|(_, v)| v))
                 .and_then(|v| v.trim().parse().ok());
 
+            // ── Parse X-Aether-Nonce (random 12-byte nonce, hex-encoded) ────────
+            let nonce_hex: Option<String> = header_str
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("x-aether-nonce:"))
+                .and_then(|l| l.split_once(':').map(|(_, v)| v))
+                .map(|v| v.trim().to_string());
+
             return Ok(HttpResponse {
                 content_length,
+                nonce_hex,
                 body_prefix,
             });
         }
@@ -173,12 +182,28 @@ pub async fn download_file_to_fd(
         file.seek(SeekFrom::Start(resume_from))
             .map_err(|e| AetherError::NetworkError(format!("Resume seek failed: {}", e)))?;
     }
+
+    // Parse the random nonce from the X-Aether-Nonce response header.
+    // The seeder generates a fresh random nonce per session, eliminating
+    // keystream-reuse risk even if the same ticket is replayed after restart.
+    let nonce_bytes: [u8; 12] = resp.nonce_hex
+        .as_deref()
+        .and_then(|h| hex::decode(h).ok())
+        .filter(|b| b.len() == 12)
+        .and_then(|b| {
+            let mut arr = [0u8; 12];
+            arr.copy_from_slice(&b);
+            Some(arr)
+        })
+        .ok_or_else(|| AetherError::SecurityError(
+            "Missing or invalid X-Aether-Nonce header from seeder".into()
+        ))?;
+
     let mut writer = BufWriter::new(file);
     let mut hasher = Sha256::new();
     let mut written = 0u64;
     let session_key = SecurityManager::derive_session_stream_key(&transport_key, &ticket)?;
-    let session_nonce = SecurityManager::derive_session_nonce(&ticket);
-    let mut cipher = ChaCha20::new((&session_key).into(), (&session_nonce).into());
+    let mut cipher = ChaCha20::new((&session_key).into(), (&nonce_bytes).into());
     cipher.seek(resume_from);
 
     // Body bytes that arrived in the same reads as the headers.
@@ -366,7 +391,7 @@ mod tests {
     // Logic extracted from read_http_response for isolation testing
     // without requiring a real TCP socket.
 
-    fn parse_header_buf(buf: &[u8]) -> Option<(bool, Option<u64>, Vec<u8>)> {
+    fn parse_header_buf(buf: &[u8]) -> Option<(bool, Option<u64>, Option<String>, Vec<u8>)> {
         let sep = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
         let header_str = String::from_utf8_lossy(&buf[..sep]);
         let body_prefix = buf[sep + 4..].to_vec();
@@ -380,13 +405,18 @@ mod tests {
             .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
             .and_then(|l| l.splitn(2, ':').nth(1))
             .and_then(|v| v.trim().parse().ok());
-        Some((ok, cl, body_prefix))
+        let nonce = header_str
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("x-aether-nonce:"))
+            .and_then(|l| l.splitn(2, ':').nth(1))
+            .map(|v| v.trim().to_string());
+        Some((ok, cl, nonce, body_prefix))
     }
 
     #[test]
     fn headers_200_with_body_prefix() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        let (ok, cl, body) = parse_header_buf(raw).unwrap();
+        let (ok, cl, _nonce, body) = parse_header_buf(raw).unwrap();
         assert!(ok);
         assert_eq!(cl, Some(5));
         assert_eq!(body, b"hello");
@@ -395,7 +425,7 @@ mod tests {
     #[test]
     fn headers_206_partial_accepted() {
         let raw = b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\n\r\nabc";
-        let (ok, cl, body) = parse_header_buf(raw).unwrap();
+        let (ok, cl, _nonce, body) = parse_header_buf(raw).unwrap();
         assert!(ok);
         assert_eq!(cl, Some(3));
         assert_eq!(body, b"abc");
@@ -409,7 +439,7 @@ mod tests {
             b"gth: 7\r\n\r\nabcdefg".as_slice(),
         ]
         .concat();
-        let (ok, cl, body) = parse_header_buf(&combined).unwrap();
+        let (ok, cl, _nonce, body) = parse_header_buf(&combined).unwrap();
         assert!(ok);
         assert_eq!(cl, Some(7));
         assert_eq!(body, b"abcdefg");
@@ -425,23 +455,33 @@ mod tests {
     #[test]
     fn non_200_status_detected() {
         let raw = b"HTTP/1.1 403 Forbidden\r\n\r\n";
-        let (ok, _, _) = parse_header_buf(raw).unwrap();
+        let (ok, _, _, _) = parse_header_buf(raw).unwrap();
         assert!(!ok);
     }
 
     #[test]
     fn content_length_header_case_insensitive() {
         let raw = b"HTTP/1.1 200 OK\r\nCONTENT-LENGTH: 42\r\n\r\n";
-        let (_, cl, _) = parse_header_buf(raw).unwrap();
+        let (_, cl, _, _) = parse_header_buf(raw).unwrap();
         assert_eq!(cl, Some(42));
     }
 
     #[test]
     fn body_empty_when_no_bytes_after_separator() {
         let raw = b"HTTP/1.1 200 OK\r\n\r\n";
-        let (ok, _, body) = parse_header_buf(raw).unwrap();
+        let (ok, _, _, body) = parse_header_buf(raw).unwrap();
         assert!(ok);
         assert!(body.is_empty());
+    }
+
+    #[test]
+    fn x_aether_nonce_parsed_from_headers() {
+        let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nX-Aether-Nonce: deadbeef0123abcd\r\n\r\nhello";
+        let (ok, cl, nonce, body) = parse_header_buf(raw).unwrap();
+        assert!(ok);
+        assert_eq!(cl, Some(5));
+        assert_eq!(nonce.as_deref(), Some("deadbeef0123abcd"));
+        assert_eq!(body, b"hello");
     }
 
     #[test]

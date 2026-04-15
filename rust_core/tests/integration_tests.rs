@@ -20,6 +20,14 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
+/// Create an AetherEngine with a dummy identity public key already set.
+/// Required since start_server() now enforces that the key is non-empty.
+fn new_engine_with_identity() -> aether_core::AetherEngine {
+    let engine = aether_core::AetherEngine::new();
+    engine.set_self_identity_public_key(vec![0x04u8; 65]).unwrap();
+    engine
+}
+
 fn write_temp(data: &[u8]) -> NamedTempFile {
     let mut f = NamedTempFile::new().unwrap();
     f.write_all(data).unwrap();
@@ -418,7 +426,7 @@ mod engine_tests {
 
     #[test]
     fn server_starts_and_returns_nonzero_port() {
-        let engine = AetherEngine::new();
+        let engine = new_engine_with_identity();
         let port = engine.start_server().expect("Server should start");
         assert!(port > 0, "Port must be > 0");
         engine.stop_server();
@@ -426,8 +434,8 @@ mod engine_tests {
 
     #[test]
     fn two_servers_get_different_ports() {
-        let e1 = AetherEngine::new();
-        let e2 = AetherEngine::new();
+        let e1 = new_engine_with_identity();
+        let e2 = new_engine_with_identity();
         let p1 = e1.start_server().unwrap();
         let p2 = e2.start_server().unwrap();
         assert_ne!(p1, p2, "Each server must bind a unique port");
@@ -437,7 +445,7 @@ mod engine_tests {
 
     #[test]
     fn ping_localhost_server_returns_true() {
-        let engine = AetherEngine::new();
+        let engine = new_engine_with_identity();
         let port = engine.start_server().unwrap();
         // Give the server a moment to be ready
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -575,7 +583,7 @@ mod seeder_tests {
         let serve_f = write_temp(payload);
 
         // ── 2. Start seeder engine ────────────────────────────────────────────
-        let seeder = AetherEngine::new();
+        let seeder = new_engine_with_identity();
         let model_id = "integration-model";
         let raw_secret = vec![0x55u8; 32];
 
@@ -620,6 +628,7 @@ mod seeder_tests {
             .download_model(
                 "127.0.0.1".into(),
                 port,
+                "seeder-1".into(),
                 ticket,
                 expected.clone(),
                 0, // fresh download
@@ -642,7 +651,7 @@ mod seeder_tests {
         let payload = b"short payload v2";
         let serve_f = write_temp(payload);
 
-        let seeder = AetherEngine::new();
+        let seeder = new_engine_with_identity();
         let raw_secret = vec![0x77u8; 32];
         seeder
             .register_file_for_serving(
@@ -689,6 +698,7 @@ mod seeder_tests {
             .download_model(
                 "127.0.0.1".into(),
                 port,
+                "seeder-1".into(),
                 ticket,
                 sha256_hex(payload),
                 0,
@@ -710,7 +720,7 @@ mod seeder_tests {
             .collect();
         let serve_f = write_temp(&full_payload);
 
-        let seeder = AetherEngine::new();
+        let seeder = new_engine_with_identity();
         let raw_secret = vec![0x99u8; 32];
         seeder
             .register_file_for_serving(
@@ -761,6 +771,7 @@ mod seeder_tests {
                 .download_model(
                     "127.0.0.1".into(),
                     port,
+                    "seeder-1".into(),
                     ticket,
                     sha256_hex(&full_payload), // full-file SHA
                     512,                       // resume_from = 512 bytes already on disk
@@ -788,7 +799,7 @@ mod seeder_tests {
         let payload = b"premium payload";
         let serve_f = write_temp(payload);
 
-        let seeder = AetherEngine::new();
+        let seeder = new_engine_with_identity();
         let raw_secret = vec![0xABu8; 32];
         seeder
             .register_file_for_serving("llm-pro".into(), serve_f.path().to_str().unwrap().into())
@@ -824,6 +835,7 @@ mod seeder_tests {
         let result = leecher.download_model(
             "127.0.0.1".into(),
             port,
+            "seeder-1".into(),
             ticket,
             sha256_hex(payload),
             0,
@@ -839,7 +851,7 @@ mod seeder_tests {
 
     #[test]
     fn heartbeat_probes_real_server() {
-        let engine = AetherEngine::new();
+        let engine = new_engine_with_identity();
         // Before start: heartbeat must fail
         assert!(
             engine.heartbeat().is_err(),
@@ -875,17 +887,16 @@ mod seeder_tests {
     fn start_seeder_node_full_flow() {
         let payload = b"Aether startSeederNode integration test v2.3.2";
         let serve_f = write_temp(payload);
-        let seeder = AetherEngine::new();
+        let seeder = new_engine_with_identity();
         let model_id = "seeder-flow-model";
         let raw_secret = vec![0xCCu8; 32];
 
         // Step 1: on a fresh engine there is no server to stop.
-        // NOTE: calling stop_server() before start_server() on a fresh engine
-        // poisons the Notify (it becomes "notified"), causing the next
-        // start_server() to shut down immediately. This mirrors the real
-        // startSeederNode flow where stopServer is only called when a server
-        // is already running.
-        // seeder.stop_server();  // ← intentionally skipped on fresh engine
+        // ADR-007: CancellationToken replaced Arc<Notify> — calling stop_server()
+        // on a fresh engine is now safe (see unit test
+        // stop_server_on_fresh_engine_does_not_poison_start). Skipped here
+        // because real startSeederNode guards with isServerRunning().
+        // seeder.stop_server();  // ← skipped: mirrors guarded startSeederNode
 
         // Step 2: register file
         seeder.register_file_for_serving(model_id.into(), serve_f.path().to_str().unwrap().into()).unwrap();
@@ -915,7 +926,7 @@ mod seeder_tests {
             .write(true).create(true).truncate(true)
             .open(out_f.path()).unwrap().into_raw_fd();
 
-        leecher.download_model("127.0.0.1".into(), port, ticket, expected.clone(), 0, out_fd).unwrap();
+        leecher.download_model("127.0.0.1".into(), port, "seeder-1".into(), ticket, expected.clone(), 0, out_fd).unwrap();
 
         let downloaded = std::fs::read(out_f.path()).unwrap();
         assert_eq!(downloaded, payload, "Downloaded bytes must match original");
@@ -931,7 +942,7 @@ mod seeder_tests {
         let serve_v1 = write_temp(payload_v1);
         let serve_v2 = write_temp(payload_v2);
 
-        let seeder = AetherEngine::new();
+        let seeder = new_engine_with_identity();
         let model_id = "reregister-model";
         let raw_secret = vec![0xDDu8; 32];
 
@@ -955,7 +966,7 @@ mod seeder_tests {
         let out1_fd = std::fs::OpenOptions::new()
             .write(true).create(true).truncate(true)
             .open(out1.path()).unwrap().into_raw_fd();
-        leecher.download_model("127.0.0.1".into(), port1, ticket1, sha256_hex(payload_v1), 0, out1_fd).unwrap();
+        leecher.download_model("127.0.0.1".into(), port1, "seeder-1".into(), ticket1, sha256_hex(payload_v1), 0, out1_fd).unwrap();
         assert_eq!(std::fs::read(out1.path()).unwrap(), payload_v1);
 
         // Re-register (startSeederNode sequence)
@@ -973,7 +984,7 @@ mod seeder_tests {
         let out2_fd = std::fs::OpenOptions::new()
             .write(true).create(true).truncate(true)
             .open(out2.path()).unwrap().into_raw_fd();
-        leecher.download_model("127.0.0.1".into(), port2, ticket2, sha256_hex(payload_v2), 0, out2_fd).unwrap();
+        leecher.download_model("127.0.0.1".into(), port2, "seeder-1".into(), ticket2, sha256_hex(payload_v2), 0, out2_fd).unwrap();
         assert_eq!(std::fs::read(out2.path()).unwrap(), payload_v2, "Re-registered model must serve new file");
         seeder.stop_server();
     }
@@ -987,7 +998,7 @@ mod seeder_tests {
         let serve_v1 = write_temp(payload_v1);
         let serve_v2 = write_temp(payload_v2);
 
-        let seeder = AetherEngine::new();
+        let seeder = new_engine_with_identity();
         let model_id = "restart-model";
         let raw_secret = vec![0xEEu8; 32];
 
@@ -1013,7 +1024,7 @@ mod seeder_tests {
         let out1_fd = std::fs::OpenOptions::new()
             .write(true).create(true).truncate(true)
             .open(out1.path()).unwrap().into_raw_fd();
-        leecher.download_model("127.0.0.1".into(), port1, ticket1, sha256_hex(payload_v1), 0, out1_fd).unwrap();
+        leecher.download_model("127.0.0.1".into(), port1, "seeder-1".into(), ticket1, sha256_hex(payload_v1), 0, out1_fd).unwrap();
         assert_eq!(std::fs::read(out1.path()).unwrap(), payload_v1);
 
         // ── startSeederNode: stop → reregister → restart ────────────────────
@@ -1031,7 +1042,7 @@ mod seeder_tests {
         let out2_fd = std::fs::OpenOptions::new()
             .write(true).create(true).truncate(true)
             .open(out2.path()).unwrap().into_raw_fd();
-        leecher.download_model("127.0.0.1".into(), port2, ticket2, sha256_hex(payload_v2), 0, out2_fd).unwrap();
+        leecher.download_model("127.0.0.1".into(), port2, "seeder-1".into(), ticket2, sha256_hex(payload_v2), 0, out2_fd).unwrap();
         assert_eq!(std::fs::read(out2.path()).unwrap(), payload_v2, "Restarted seeder must serve new file");
         seeder.stop_server();
     }

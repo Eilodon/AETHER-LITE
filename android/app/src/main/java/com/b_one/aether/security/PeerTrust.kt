@@ -1,6 +1,9 @@
 package com.b_one.aether.security
 
 import android.content.Context
+import android.content.SharedPreferences
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKeys
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.util.Base64
@@ -176,7 +179,21 @@ object PeerTrust {
 }
 
 class PeerPinStore(context: Context) {
-    private val prefs = context.getSharedPreferences("aether_peer_pins", Context.MODE_PRIVATE)
+    // ADR-008: EncryptedSharedPreferences replaces plaintext SharedPreferences.
+    // Implements the same SharedPreferences interface — read/write code unchanged.
+    private val prefs: SharedPreferences = EncryptedSharedPreferences.create(
+        "aether_peer_pins_encrypted",
+        MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC),
+        context,
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+    )
+
+    init {
+        // One-time migration: copy pins from old plaintext SharedPreferences
+        // into the new encrypted store, then delete the old file.
+        migrateFromPlaintext(context)
+    }
 
     fun get(peerId: String): PeerPin? {
         val raw = prefs.getString(key(peerId), null) ?: return null
@@ -215,5 +232,21 @@ class PeerPinStore(context: Context) {
             addedAtEpochMs = json.getLong("added_at_epoch_ms"),
             lastValidatedAtEpochMs = json.getLong("last_validated_at_epoch_ms")
         )
+    }
+
+    private fun migrateFromPlaintext(context: Context) {
+        val oldPrefs = context.getSharedPreferences("aether_peer_pins", Context.MODE_PRIVATE)
+        if (oldPrefs.all.isEmpty()) return  // nothing to migrate
+
+        val editor = prefs.edit()
+        for ((k, v) in oldPrefs.all) {
+            if (k.startsWith("peer_pin:") && v is String) {
+                editor.putString(k, v)
+            }
+        }
+        editor.apply()
+
+        // Delete old plaintext data
+        oldPrefs.edit().clear().apply()
     }
 }

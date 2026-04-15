@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Security
 
 enum PeerTrustMode: String, Codable {
     case tofu = "TOFU"
@@ -222,16 +223,21 @@ enum PeerTrust {
 }
 
 final class PeerPinStore {
-    private let defaults: UserDefaults
-    private let storageKey = "aether.peerPins"
+    // ADR-008: Keychain replaces UserDefaults for peer pin storage.
+    // Pins are stored as kSecClassGenericPassword items with the peer ID
+    // as the account name and the JSON-encoded pin as the data.
+    private let service: String
+    private let defaults: UserDefaults  // kept only for migration
 
-    init(defaults: UserDefaults = .standard) {
+    init(service: String = Bundle.main.bundleIdentifier ?? "com.b_one.aether",
+         defaults: UserDefaults = .standard) {
+        self.service = service
         self.defaults = defaults
+        migrateFromUserDefaults()
     }
 
     func get(peerId: String) -> PeerPin? {
-        var pins = loadAll()
-        return pins[peerId]
+        loadAll()[peerId]
     }
 
     func save(_ pin: PeerPin) {
@@ -246,14 +252,60 @@ final class PeerPinStore {
         persist(pins)
     }
 
+    // ── Keychain helpers ────────────────────────────────────────────────────
+
     private func loadAll() -> [String: PeerPin] {
-        guard let data = defaults.data(forKey: storageKey) else { return [:] }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+
+        guard status == errSecSuccess, let data = result as? Data else { return [:] }
         return (try? JSONDecoder().decode([String: PeerPin].self, from: data)) ?? [:]
     }
 
     private func persist(_ pins: [String: PeerPin]) {
         guard let data = try? JSONEncoder().encode(pins) else { return }
-        defaults.set(data, forKey: storageKey)
+
+        // Delete existing then add — simpler than update
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+
+        let addQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecValueData as String: data,
+        ]
+        SecItemAdd(addQuery as CFDictionary, nil)
+    }
+
+    // ── Migration ────────────────────────────────────────────────────────────
+
+    private func migrateFromUserDefaults() {
+        let oldKey = "aether.peerPins"
+        guard let oldData = defaults.data(forKey: oldKey) else { return }
+
+        // Read old pins
+        guard let oldPins = try? JSONDecoder().decode([String: PeerPin].self, from: oldData),
+              !oldPins.isEmpty else { return }
+
+        // Merge into Keychain (existing Keychain pins take precedence)
+        var existing = loadAll()
+        for (id, pin) in oldPins where existing[id] == nil {
+            existing[id] = pin
+        }
+        persist(existing)
+
+        // Delete old UserDefaults data
+        defaults.removeObject(forKey: oldKey)
     }
 
     static func currentEpochMs() -> UInt64 {

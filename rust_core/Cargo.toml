@@ -27,6 +27,7 @@ hmac    = "0.12"
 hkdf    = "0.12"        # HKDF-SHA256 for key derivation from ECDH shared secret
 sha2    = "0.10"
 chacha20 = "0.9"
+rand     = "0.8"
 hex     = "0.4"
 base64  = "0.21"
 zeroize = { version = "1.7", features = ["derive"] }

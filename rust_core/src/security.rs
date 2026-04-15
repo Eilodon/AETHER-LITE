@@ -7,7 +7,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use ring::signature::{self, UnparsedPublicKey};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -29,7 +29,7 @@ impl SecurityManager {
 
     /// Verify an HMAC-SHA256 ticket and its timestamp window.
     ///
-    /// Ticket format: `<model_id>|<version>|<unix_timestamp>.<base64-HMAC>`
+    /// Ticket format: `<model_id>|<version>|<unix_timestamp>|<issuer_peer_id>.<base64-HMAC>`
     pub fn verify_ticket(ticket: &str, secret: &SecureKey) -> Result<(), AetherError> {
         let (payload, signature_b64) = ticket.rsplit_once('.').ok_or(AetherError::InvalidTicket)?;
         if payload.is_empty() || signature_b64.is_empty() {
@@ -50,7 +50,10 @@ impl SecurityManager {
 
         // Timestamp window (anti-replay).
         let fields: Vec<&str> = payload.split('|').collect();
-        if fields.len() < 3 {
+        if fields.len() < 4 {
+            return Err(AetherError::InvalidTicket);
+        }
+        if fields[3].is_empty() {
             return Err(AetherError::InvalidTicket);
         }
         let ts: u64 = fields[2].parse().map_err(|_| AetherError::InvalidTicket)?;
@@ -155,13 +158,14 @@ impl SecurityManager {
         Ok(output)
     }
 
-    pub fn derive_session_nonce(ticket: &str) -> [u8; 12] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"aether-stream-nonce-v1");
-        hasher.update(ticket.as_bytes());
-        let digest = hasher.finalize();
+    /// Generate a cryptographically random 12-byte nonce for ChaCha20.
+    ///
+    /// Each session gets a unique nonce, eliminating keystream-reuse risk
+    /// even if the same ticket+key pair is used across seeder restarts.
+    pub fn generate_random_nonce() -> [u8; 12] {
+        use rand::RngCore;
         let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&digest[..12]);
+        rand::thread_rng().fill_bytes(&mut nonce);
         nonce
     }
 

@@ -78,7 +78,7 @@ cd rust_core
 cargo test
 ```
 
-Expected: **40 tests passed** (16 unit + 24 integration).
+Expected: **84 tests passed** (47 unit + 37 integration).
 
 ### 2. Install cross-compilation targets
 
@@ -236,13 +236,13 @@ try await AetherManager.shared.applySmartPatch(
 
 | Scope | Tests |
 |-------|-------|
-| Rust unit | 33 |
-| Rust integration | 34 |
+| Rust unit | 47 |
+| Rust integration | 37 |
 | Android JVM unit | 19 |
 | Android instrumented | 6 |
 | iOS XCTest | 23 |
 | Python (forge tool) | 37 |
-| **Total** | **152** |
+| **Total** | **169** |
 
 ---
 

@@ -9,6 +9,7 @@
 import XCTest
 import CryptoKit
 @testable import AetherApp
+import AetherFFI
 
 final class VaultTests: XCTestCase {
 
@@ -343,5 +344,29 @@ final class HeartbeatBackoffTests: XCTestCase {
             delay = min(delay * 2, 30_000_000_000)
         }
         XCTAssertEqual(delay, 30_000_000_000)
+    }
+}
+
+// ── Rust FFI Canonical JSON cross-validation (ADR-009) ────────────────────────
+
+final class RustCanonicalJSONTests: XCTestCase {
+
+    /// ADR-009: Verify that the Rust engine's canonicalizeJson() produces
+    /// output matching the local Swift canonical() implementation. If the
+    /// two diverge, the onboarding payload fingerprint will mismatch.
+    func test_rustEngineCanonicalMatchesSwiftCanonical() throws {
+        let engine = AetherEngine()
+        let input = #"{"z":"last","a":"first","full":{"url":"x","size":1}}"#
+        let rustResult = try engine.canonicalizeJson(json: input)
+
+        // Expected output from both Rust and Swift canonical implementations
+        XCTAssertEqual(rustResult, #"{"a":"first","full":{"size":1,"url":"x"},"z":"last"}"#)
+    }
+
+    func test_rustEngineCanonicalSortsFlatKeys() throws {
+        let engine = AetherEngine()
+        let input = #"{"z":"last","a":"first","m":"mid"}"#
+        let rustResult = try engine.canonicalizeJson(json: input)
+        XCTAssertEqual(rustResult, #"{"a":"first","m":"mid","z":"last"}"#)
     }
 }
