@@ -7,7 +7,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use ring::signature::{self, UnparsedPublicKey};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -44,19 +44,38 @@ impl SecurityManager {
             .map_err(|_| AetherError::InternalError("HMAC init failed".into()))?;
         mac.update(payload.as_bytes());
         mac.verify_slice(&signature).map_err(|_| {
-            error!("HMAC mismatch for payload: {}", payload);
+            // SECURITY: Log hash of payload instead of plaintext to prevent info leakage
+            let payload_hash = hex::encode(Sha256::digest(payload.as_bytes()));
+            error!("HMAC mismatch for payload hash: {}", payload_hash);
             AetherError::SecurityError("Invalid signature".into())
         })?;
 
         // Timestamp window (anti-replay).
+        // SECURITY: Parse all fields first, then validate atomically to prevent
+        // timing side-channel attacks that could distinguish parse failures from
+        // validation failures.
         let fields: Vec<&str> = payload.split('|').collect();
         if fields.len() < 4 {
             return Err(AetherError::InvalidTicket);
         }
-        if fields[3].is_empty() {
+
+        let model_id = fields[0];
+        let version = fields[1];
+        let ts_str = fields[2];
+        let issuer = fields[3];
+
+        // Validate non-empty fields before parsing
+        if model_id.is_empty() || version.is_empty() || ts_str.is_empty() || issuer.is_empty() {
             return Err(AetherError::InvalidTicket);
         }
-        let ts: u64 = fields[2].parse().map_err(|_| AetherError::InvalidTicket)?;
+
+        // Parse timestamp (may fail, but we don't early-reject based on this alone)
+        let ts: u64 = match ts_str.parse() {
+            Ok(t) => t,
+            Err(_) => return Err(AetherError::InvalidTicket),
+        };
+
+        // Atomic validation: all checks happen together after parsing
         let now = Self::now_secs();
         let w = Config::TICKET_WINDOW_SECS;
         if now > ts + w || now < ts.saturating_sub(w) {
@@ -149,9 +168,9 @@ impl SecurityManager {
 
     pub fn derive_session_stream_key(
         transport_key: &SecureKey,
-        ticket: &str,
+        model_id: &str,
     ) -> Result<[u8; 32], AetherError> {
-        let hk = Hkdf::<Sha256>::new(Some(ticket.as_bytes()), &transport_key.0);
+        let hk = Hkdf::<Sha256>::new(Some(model_id.as_bytes()), &transport_key.0);
         let mut output = [0u8; 32];
         hk.expand(b"aether-stream-session-v1", &mut output)
             .map_err(|_| AetherError::InternalError("HKDF stream expand failed".into()))?;

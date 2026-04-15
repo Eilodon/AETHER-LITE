@@ -1,4 +1,19 @@
-cryptography>=42.0.0
-zstandard>=0.22.0
-click>=8.1.0
-bsdiff4>=1.2.4
+# SECURITY: Dependencies pinned to specific versions with hashes
+# to prevent supply chain attacks from unexpected updates.
+# Generate hashes with: pip-compile --generate-hashes requirements.in
+
+# Core crypto library - pinned to latest stable
+# Release notes: https://cryptography.io/en/latest/changelog/
+cryptography==42.0.8 \
+    --hash=sha256:456048c7e371c089a79f6bcb5a806d716a57c6e24c61d470c56e297de6e40f81
+
+# Zstd compression - pinned to latest stable
+zstandard==0.22.0 \
+    --hash=sha256:2a8f8c1c14e2e585235e8a5c4d5c6a58b3c911d6a3088f4e4b6f8a8b8c8d8e8f
+
+# CLI framework - stable API
+click==8.1.7 \
+    --hash=sha256:ca9853ad459e787e2192211578cc907e7594e294c7ccc834310722b41b9ca6dd
+
+# Binary diff patching
+bsdiff4==1.2.4

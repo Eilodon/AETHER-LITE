@@ -223,14 +223,37 @@ class PeerPinStore(context: Context) {
 
     private fun decode(raw: String): PeerPin {
         val json = JSONObject(raw)
+        val peerId = json.getString("peer_id")
+        val publicKeyHex = json.getString("public_key_hex")
+        val publicKeySha256 = json.getString("public_key_sha256")
+        val protocolVersion = json.optString("protocol_version", "")
+        val trustModeStr = json.getString("trust_mode")
+        val addedAtEpochMs = json.getLong("added_at_epoch_ms")
+        val lastValidatedAtEpochMs = json.getLong("last_validated_at_epoch_ms")
+
+        // Validation: bounds check on timestamps (must be reasonable epoch ms)
+        val now = System.currentTimeMillis()
+        val year2020 = 1577836800000L // 2020-01-01 in epoch ms
+        require(addedAtEpochMs in year2020..now + 86400000L) { "Invalid added_at_epoch_ms: $addedAtEpochMs" }
+        require(lastValidatedAtEpochMs in year2020..now + 86400000L) { "Invalid last_validated_at_epoch_ms: $lastValidatedAtEpochMs" }
+
+        // Validation: public key hex must be 130 chars (65 bytes = 130 hex chars for P-256 uncompressed)
+        require(publicKeyHex.length == 130 && publicKeyHex.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) {
+            "Invalid publicKeyHex format"
+        }
+        // Validation: SHA-256 must be 64 hex chars
+        require(publicKeySha256.length == 64 && publicKeySha256.all { it.isDigit() || it.lowercaseChar() in 'a'..'f' }) {
+            "Invalid publicKeySha256 format"
+        }
+
         return PeerPin(
-            peerId = json.getString("peer_id"),
-            publicKeyHex = json.getString("public_key_hex"),
-            publicKeySha256 = json.getString("public_key_sha256"),
-            protocolVersion = json.optString("protocol_version", ""),
-            trustMode = PeerTrustMode.valueOf(json.getString("trust_mode")),
-            addedAtEpochMs = json.getLong("added_at_epoch_ms"),
-            lastValidatedAtEpochMs = json.getLong("last_validated_at_epoch_ms")
+            peerId = peerId,
+            publicKeyHex = publicKeyHex,
+            publicKeySha256 = publicKeySha256,
+            protocolVersion = protocolVersion,
+            trustMode = PeerTrustMode.valueOf(trustModeStr),
+            addedAtEpochMs = addedAtEpochMs,
+            lastValidatedAtEpochMs = lastValidatedAtEpochMs
         )
     }
 

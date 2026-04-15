@@ -3,6 +3,7 @@ package com.b_one.aether.security
 
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import java.math.BigInteger
 import java.security.KeyFactory
 import java.security.KeyPairGenerator
 import java.security.KeyStore
@@ -56,16 +57,27 @@ object SecureVault {
     /**
      * ADR-003: ECDH key agreement with a remote peer.
      *
+     * Validates that the peer public key lies on the P-256 curve before ECDH
+     * to prevent small subgroup attacks and invalid curve attacks (CVE-2021-22543).
+     *
      * @param peerPublicKeyBytes X9.62 uncompressed EC public key (65 bytes) from the peer.
      *   The wire format is now standardized on X9.62 for Android↔iOS interop.
      * @return 32-byte shared secret.
+     * @throws IllegalArgumentException if the point is not on P-256 curve
      */
     fun performHandshake(peerPublicKeyBytes: ByteArray): ByteArray {
+        // 1. Validate X9.62 format
+        require(peerPublicKeyBytes.size == 65 && peerPublicKeyBytes[0] == 0x04.toByte()) {
+            "Invalid X9.62 format: expected 65 bytes starting with 0x04"
+        }
+
+        // 2. Validate point is on P-256 curve (NIST SP 800-56A Section 5.6.2.3.2)
+        validateP256Point(peerPublicKeyBytes)
+
         val ks         = loadKeyStore()
         val privateKey = ks.getKey(KEY_ALIAS, null) as PrivateKey
 
-        // ADR-003: wrap the inbound X9.62 (65-byte) key in a DER SubjectPublicKeyInfo
-        // header before feeding to KeyFactory, which expects X509EncodedKeySpec (DER).
+        // 3. Wrap the inbound X9.62 (65-byte) key in a DER SubjectPublicKeyInfo
         val derBytes   = encodeX962ToDer(peerPublicKeyBytes)
         val keyFactory = KeyFactory.getInstance(EC_ALGORITHM)
         val peerKey    = keyFactory.generatePublic(X509EncodedKeySpec(derBytes))
@@ -75,6 +87,41 @@ object SecureVault {
             doPhase(peerKey, true)
             generateSecret()   // 32 bytes for P-256
         }
+    }
+
+    /**
+     * Validate that an uncompressed EC point lies on the P-256 (secp256r1) curve.
+     *
+     * Curve equation: y² = x³ - 3x + b (mod p)
+     *
+     * This prevents:
+     * - Small subgroup attacks (point on weak curve)
+     * - Invalid curve attacks (point not on any valid curve)
+     * - Point at infinity attacks
+     *
+     * @param x962 65-byte X9.62 uncompressed point (0x04 || x || y)
+     * @throws IllegalArgumentException if point is not on P-256 curve
+     */
+    private fun validateP256Point(x962: ByteArray) {
+        // P-256 prime field
+        val p = BigInteger("FFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF", 16)
+        // P-256 curve coefficient b
+        val b = BigInteger("5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B", 16)
+
+        val x = BigInteger(1, x962.copyOfRange(1, 33))
+        val y = BigInteger(1, x962.copyOfRange(33, 65))
+
+        // Check coordinates are in range [1, p-1]
+        require(x in BigInteger.ONE..<p) { "x coordinate out of range or zero" }
+        require(y in BigInteger.ONE..<p) { "y coordinate out of range or zero" }
+
+        // Verify curve equation: y² ≡ x³ - 3x + b (mod p)
+        val left = y.modPow(BigInteger.valueOf(2), p)
+        val x3 = x.modPow(BigInteger.valueOf(3), p)
+        val threeX = BigInteger.valueOf(3).multiply(x).mod(p)
+        val right = x3.subtract(threeX).add(b).mod(p)
+
+        require(left == right) { "Point not on P-256 curve: curve equation check failed" }
     }
 
     // ── Manifest ECDSA Verification ───────────────────────────────────────────

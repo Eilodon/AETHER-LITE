@@ -4,6 +4,7 @@
 //! Decompresses a `.zst` file created by `forge.py` (Zstandard level 19)
 //! into a raw binary output file, without loading the entire payload into RAM.
 
+use crate::config::Config;
 use crate::error::AetherError;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -38,10 +39,17 @@ pub fn decompress_zstd_fds(compressed_fd: i32, output_fd: i32) -> Result<u64, Ae
         match decoder.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                total_bytes += n as u64;
+                // SECURITY: Prevent decompression bomb attacks
+                if total_bytes > Config::MAX_DECOMPRESSED_SIZE {
+                    return Err(AetherError::DecompressError(format!(
+                        "Decompressed size exceeds maximum limit of {} bytes (bomb protection)",
+                        Config::MAX_DECOMPRESSED_SIZE
+                    )));
+                }
                 writer
                     .write_all(&buf[..n])
                     .map_err(|e| AetherError::DecompressError(format!("Write failed: {}", e)))?;
-                total_bytes += n as u64;
             }
             Err(e) => {
                 return Err(AetherError::DecompressError(format!("Read failed: {}", e)));

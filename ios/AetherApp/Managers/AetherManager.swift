@@ -420,16 +420,20 @@ final class AetherManager: ObservableObject {
         // ADR-007: guard — only stop if server is actually running
         if engine?.isServerRunning() == true {
             engine?.stopServer()
+            // Poll until server is actually stopped (TCP socket released)
+            Task.detached(priority: .userInitiated) {
+                while await self.engine?.isServerRunning() == true {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
+                }
+                await MainActor.run {
+                    self.startNode()
+                }
+            }
+            return
         }
         isNodeActive = false
         activePort = 0
-
-        Task.detached(priority: .userInitiated) {
-            try? await Task.sleep(nanoseconds: 250_000_000)
-            await MainActor.run {
-                self.startNode()
-            }
-        }
+        startNode()
     }
 
     private func getStablePeerId() -> String {

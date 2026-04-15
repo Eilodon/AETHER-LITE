@@ -63,6 +63,8 @@ struct AppState {
     shutdown_token: RwLock<CancellationToken>,
     /// Limits concurrent download sessions to prevent resource exhaustion.
     download_limiter: Arc<Semaphore>,
+    /// Per-peer download limiters to prevent a single peer from exhausting slots.
+    peer_limiters: DashMap<String, Arc<Semaphore>>,
     /// Files registered for serving by model_id → absolute path on disk.
     /// Populated by `register_file_for_serving` before a peer connects.
     serve_files: DashMap<String, PathBuf>,
@@ -128,6 +130,7 @@ impl AetherEngine {
                 seen_tickets: DashMap::new(),
                 shutdown_token: RwLock::new(CancellationToken::new()),
                 download_limiter: Arc::new(Semaphore::new(Config::MAX_CONCURRENT_DOWNLOADS)),
+                peer_limiters: DashMap::new(),
                 serve_files: DashMap::new(),
             }),
             rt: Arc::new(Runtime::new().expect("Tokio runtime init failed")),
@@ -326,6 +329,10 @@ impl AetherEngine {
     /// in-memory engine state. ADR-011: mobile `removePinnedPeer()` must call
     /// this in addition to clearing persistent storage, so that a revoked peer
     /// cannot continue downloading in the current session.
+    ///
+    /// Note: DashMap operations are individually atomic but the sequence is not.
+    /// The window between key and permission removal is small (~ns) and the
+    /// worst case is an auth failure for an in-progress request.
     pub fn revoke_peer(&self, peer_id: String) -> Result<(), AetherError> {
         let had_keys = self.state.peer_keys.remove(&peer_id).is_some();
         let had_perms = self.state.peer_permissions.remove(&peer_id).is_some();
@@ -536,6 +543,25 @@ async fn download_handler(
         None => return (StatusCode::BAD_REQUEST, "Missing pid").into_response(),
     };
 
+    // ── Per-peer rate limit ─────────────────────────────────────────────────
+    // SECURITY: Prevent a single peer from exhausting all global download slots
+    let peer_limiter = state
+        .app
+        .peer_limiters
+        .entry(peer_id.clone())
+        .or_insert_with(|| Arc::new(Semaphore::new(Config::MAX_DOWNLOADS_PER_PEER)))
+        .clone();
+    let _peer_permit = match peer_limiter.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Per-peer rate limit exceeded",
+            )
+                .into_response()
+        }
+    };
+
     let ticket_str = {
         let primary = headers.get(Config::get_header_key());
         let fallback = headers.get("X-Aether-Ticket");
@@ -725,11 +751,17 @@ fn encrypted_file_stream(
     transport_key: &SecureKey,
     nonce: &[u8; 12],
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
-    let ticket = ticket.to_string();
+    // Extract model_id from ticket for HKDF salt (not the ticket itself).
+    let model_id = ticket
+        .rsplit_once('.')
+        .map(|(payload, _)| payload)
+        .and_then(|payload| payload.split('|').next())
+        .unwrap_or("")
+        .to_string();
     let transport_key = transport_key.clone();
     let nonce = *nonce;
     try_stream! {
-        let session_key = SecurityManager::derive_session_stream_key(&transport_key, &ticket)
+        let session_key = SecurityManager::derive_session_stream_key(&transport_key, &model_id)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let mut cipher = ChaCha20::new((&session_key).into(), (&nonce).into());
         file.seek(std::io::SeekFrom::Start(start)).await?;

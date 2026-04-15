@@ -271,20 +271,26 @@ final class PeerPinStore {
     private func persist(_ pins: [String: PeerPin]) {
         guard let data = try? JSONEncoder().encode(pins) else { return }
 
-        // Delete existing then add — simpler than update
-        let deleteQuery: [String: Any] = [
+        // Atomic update: try SecItemUpdate first, fall back to SecItemAdd if not exists
+        let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
         ]
-        SecItemDelete(deleteQuery as CFDictionary)
-
-        let addQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        let updateQuery: [String: Any] = [
             kSecValueData as String: data,
         ]
-        SecItemAdd(addQuery as CFDictionary, nil)
+
+        let status = SecItemUpdate(query as CFDictionary, updateQuery as CFDictionary)
+        if status == errSecItemNotFound {
+            // Item doesn't exist, add it
+            let addQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+                kSecValueData as String: data,
+            ]
+            SecItemAdd(addQuery as CFDictionary, nil)
+        }
     }
 
     // ── Migration ────────────────────────────────────────────────────────────

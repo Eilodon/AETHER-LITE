@@ -13,11 +13,31 @@ use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::FromRawFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{error, info, warn};
+
+// ── Security helpers ────────────────────────────────────────────────────────
+
+/// Validate that a string is safe to use as an HTTP header value.
+/// RFC 7230 Section 3.2.4: field-content must not contain CR, LF, or other control chars.
+fn validate_header_value(value: &str) -> Result<(), AetherError> {
+    // RFC 7230: field-content cannot contain CR or LF
+    if value.contains('\r') || value.contains('\n') {
+        return Err(AetherError::SecurityError(
+            "Invalid header value: contains CRLF (possible injection attack)".into(),
+        ));
+    }
+    // Also block other control characters (except tab which is allowed)
+    if value.chars().any(|c| c.is_ascii_control() && c != '\t') {
+        return Err(AetherError::SecurityError(
+            "Invalid header value: contains control characters".into(),
+        ));
+    }
+    Ok(())
+}
 
 // ── HTTP response type ────────────────────────────────────────────────────────
 
@@ -151,6 +171,10 @@ pub async fn download_file_to_fd(
         .await
         .map_err(|e| AetherError::NetworkError(format!("Connect failed: {}", e)))?;
 
+    // ── Validate header values to prevent CRLF injection ─────────────────────
+    validate_header_value(&self_peer_id)?;
+    validate_header_value(&ticket)?;
+
     // ── Build HTTP request ────────────────────────────────────────────────────
     let mut req = format!(
         "GET /download?pid={} HTTP/1.1\r\n\
@@ -199,10 +223,17 @@ pub async fn download_file_to_fd(
             "Missing or invalid X-Aether-Nonce header from seeder".into()
         ))?;
 
-    let mut writer = BufWriter::new(file);
+    let mut async_file = tokio::fs::File::from_std(file);
     let mut hasher = Sha256::new();
     let mut written = 0u64;
-    let session_key = SecurityManager::derive_session_stream_key(&transport_key, &ticket)?;
+    // Extract model_id from ticket payload for HKDF salt (not the ticket itself).
+    // Ticket format: <model_id>|<version>|<timestamp>|<issuer_peer_id>.<HMAC>
+    let model_id = ticket
+        .rsplit_once('.')
+        .map(|(payload, _)| payload)
+        .and_then(|payload| payload.split('|').next())
+        .ok_or_else(|| AetherError::SecurityError("Cannot extract model_id from ticket".into()))?;
+    let session_key = SecurityManager::derive_session_stream_key(&transport_key, model_id)?;
     let mut cipher = ChaCha20::new((&session_key).into(), (&nonce_bytes).into());
     cipher.seek(resume_from);
 
@@ -210,30 +241,25 @@ pub async fn download_file_to_fd(
     if !resp.body_prefix.is_empty() {
         let mut decrypted = resp.body_prefix.clone();
         cipher.apply_keystream(&mut decrypted);
-        writer
+        async_file
             .write_all(&decrypted)
+            .await
             .map_err(|e| AetherError::InternalError(format!("Initial write failed: {}", e)))?;
         hasher.update(&decrypted);
         written += decrypted.len() as u64;
     }
 
-    // Switch to blocking I/O for the bulk transfer loop.
-    let mut std_stream = stream
-        .into_std()
-        .map_err(|e| AetherError::NetworkError(e.to_string()))?;
-    std_stream
-        .set_nonblocking(false)
-        .map_err(|e| AetherError::NetworkError(e.to_string()))?;
-
+    // Fully async transfer loop — no blocking I/O, no thread starvation.
     let mut chunk_buf = vec![0u8; 64 * 1024]; // 64 KB read chunks
     loop {
-        match std_stream.read(&mut chunk_buf) {
+        match stream.read(&mut chunk_buf).await {
             Ok(0) => break,
             Ok(k) => {
                 let mut decrypted = chunk_buf[..k].to_vec();
                 cipher.apply_keystream(&mut decrypted);
-                writer
+                async_file
                     .write_all(&decrypted)
+                    .await
                     .map_err(|e| AetherError::NetworkError(format!("Write failed: {}", e)))?;
                 hasher.update(&decrypted);
                 written += k as u64;
@@ -242,8 +268,9 @@ pub async fn download_file_to_fd(
         }
     }
 
-    writer
+    async_file
         .flush()
+        .await
         .map_err(|e| AetherError::NetworkError(format!("Flush failed: {}", e)))?;
 
     // ── Content-Length check ──────────────────────────────────────────────────
@@ -263,7 +290,7 @@ pub async fn download_file_to_fd(
         // ADR-002: resumed downloads — inline hasher only covers this session's bytes.
         // Rehash the full file from byte 0 via /proc/self/fd or /dev/fd.
         let actual = if resume_from > 0 {
-            rehash_full_file(&writer)?
+            rehash_full_file(&async_file)?
         } else {
             hex::encode(hasher.finalize())
         };
@@ -281,15 +308,15 @@ pub async fn download_file_to_fd(
         info!("SHA-256 verified ✓");
     }
 
-    // `writer` (and inner `File`) drops here → close(fd).
+    // `async_file` drops here → close(fd).
     Ok(())
 }
 
 /// Re-hash the full file from byte 0 via the fd symlink in /proc or /dev.
 /// Required for ADR-002: resumed downloads must validate the complete file.
-fn rehash_full_file(writer: &BufWriter<File>) -> Result<String, AetherError> {
+fn rehash_full_file(file: &tokio::fs::File) -> Result<String, AetherError> {
     use std::os::unix::io::AsRawFd;
-    let actual_fd = writer.get_ref().as_raw_fd();
+    let actual_fd = file.as_raw_fd();
 
     #[cfg(target_os = "linux")]
     let proc_path = format!("/proc/self/fd/{}", actual_fd);

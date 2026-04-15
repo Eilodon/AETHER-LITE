@@ -446,7 +446,10 @@ class AetherService : Service() {
                 // ADR-007: guard — only stop if server is actually running
                 if (rustEngine.isServerRunning()) {
                     rustEngine.stopServer()
-                    delay(250)  // wait for TCP socket release
+                    // Poll until server is actually stopped (TCP socket released)
+                    repeat {
+                        delay(50)
+                    } while (rustEngine.isServerRunning())
                 }
 
                 rustEngine.registerFileForServing(modelId = modelId, filePath = filePath)

@@ -23,12 +23,19 @@ impl Config {
     /// Maximum concurrent download sessions served simultaneously.
     pub const MAX_CONCURRENT_DOWNLOADS: usize = 10;
 
+    /// Maximum concurrent downloads allowed per peer to prevent DoS.
+    pub const MAX_DOWNLOADS_PER_PEER: usize = 3;
+
     /// Current bspatch pipeline buffers the old file and patch delta in RAM.
     /// Keep the combined input under this ceiling to avoid OOM on low-RAM devices.
     pub const MAX_PATCH_BUFFERED_INPUT_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
     /// Individual patch delta ceiling. Typical mobile updates are well below this.
     pub const MAX_PATCH_DELTA_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+    /// Maximum decompressed output size to prevent decompression bomb attacks.
+    /// Zstd has extreme compression ratios; this limits memory/disk exhaustion.
+    pub const MAX_DECOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
 
     /// Obfuscated auth header name.
     #[inline(always)]
