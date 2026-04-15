@@ -130,13 +130,31 @@ final class AetherManager: ObservableObject {
             throw AetherError.SecurityError("Peer public key fingerprint mismatch")
         }
 
-        let trustDecision = try PeerTrust.evaluateHandshake(
-            peerId: peerId,
-            publicKeyHex: publicKeyHex,
-            protocolVersion: peerProtocolVersion,
-            existingPin: peerPinStore.get(peerId: peerId),
-            trustOnFirstUse: trustOnFirstUse
-        )
+        let existingPin = peerPinStore.get(peerId: peerId)
+        let trustDecision: PeerTrustDecision
+        if let existingPin {
+            trustDecision = try PeerTrust.evaluateHandshake(
+                peerId: peerId,
+                publicKeyHex: publicKeyHex,
+                protocolVersion: peerProtocolVersion,
+                existingPin: existingPin,
+                trustOnFirstUse: false
+            )
+        } else if expectedPeerPublicKeySha256 != nil {
+            trustDecision = try PeerTrust.pinnedDecisionFromVerifiedFingerprint(
+                peerId: peerId,
+                publicKeyHex: publicKeyHex,
+                protocolVersion: peerProtocolVersion
+            )
+        } else if trustOnFirstUse {
+            throw AetherError.SecurityError(
+                "Plaintext /identity bootstrap requires an existing pin or expected peer fingerprint; TOFU over HTTP is disabled"
+            )
+        } else {
+            throw AetherError.SecurityError(
+                "Peer is not pinned; complete QR onboarding or provide an expected peer fingerprint before using /identity"
+            )
+        }
 
         guard let sharedSecret = Vault.shared.performHandshake(peerPublicKeyBytes: publicKey) else {
             throw AetherError.KeyExchangeFailed

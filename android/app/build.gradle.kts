@@ -5,6 +5,24 @@ plugins {
     id("org.mozilla.rust-android-gradle.rust-android")
 }
 
+val repoRoot = rootProject.projectDir.parentFile
+
+val generateUniffiKotlinBindings by tasks.registering(Exec::class) {
+    workingDir = repoRoot
+    commandLine(
+        "cargo",
+        "run",
+        "--manifest-path",
+        "tools/uniffi-bindgen-kotlin/Cargo.toml",
+        "--",
+        "rust_core/src/aether.udl",
+        "android/app/src/main/java",
+        "aether_core"
+    )
+    inputs.file(repoRoot.resolve("rust_core/src/aether.udl"))
+    outputs.file(repoRoot.resolve("android/app/src/main/java/uniffi/aether_core/aether_core.kt"))
+}
+
 android {
     namespace   = "com.b_one.aether"
     compileSdk  = 34
@@ -50,6 +68,10 @@ android {
     }
 }
 
+tasks.named("preBuild").configure {
+    dependsOn(generateUniffiKotlinBindings)
+}
+
 // ── Rust Cargo configuration ──────────────────────────────────────────────────
 cargo {
     module  = "../../rust_core"    // Path to Cargo workspace
@@ -80,6 +102,7 @@ dependencies {
 
     // Testing
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
 }

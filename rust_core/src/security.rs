@@ -25,6 +25,26 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct SecurityManager;
 
 impl SecurityManager {
+    fn split_ticket_payload<'a>(
+        ticket: &'a str,
+    ) -> Result<(&'a str, &'a str, &'a str, &'a str), AetherError> {
+        let (payload, _signature_b64) =
+            ticket.rsplit_once('.').ok_or(AetherError::InvalidTicket)?;
+        let fields: Vec<&str> = payload.split('|').collect();
+        if fields.len() < 4 {
+            return Err(AetherError::InvalidTicket);
+        }
+
+        let model_id = fields[0];
+        let version = fields[1];
+        let ts_str = fields[2];
+        let issuer = fields[3];
+        if model_id.is_empty() || version.is_empty() || ts_str.is_empty() || issuer.is_empty() {
+            return Err(AetherError::InvalidTicket);
+        }
+        Ok((model_id, version, ts_str, issuer))
+    }
+
     // ── Ticket verification ───────────────────────────────────────────────────
 
     /// Verify an HMAC-SHA256 ticket and its timestamp window.
@@ -54,20 +74,7 @@ impl SecurityManager {
         // SECURITY: Parse all fields first, then validate atomically to prevent
         // timing side-channel attacks that could distinguish parse failures from
         // validation failures.
-        let fields: Vec<&str> = payload.split('|').collect();
-        if fields.len() < 4 {
-            return Err(AetherError::InvalidTicket);
-        }
-
-        let model_id = fields[0];
-        let version = fields[1];
-        let ts_str = fields[2];
-        let issuer = fields[3];
-
-        // Validate non-empty fields before parsing
-        if model_id.is_empty() || version.is_empty() || ts_str.is_empty() || issuer.is_empty() {
-            return Err(AetherError::InvalidTicket);
-        }
+        let (_model_id, _version, ts_str, _issuer) = Self::split_ticket_payload(ticket)?;
 
         // Parse timestamp (may fail, but we don't early-reject based on this alone)
         let ts: u64 = match ts_str.parse() {
@@ -83,6 +90,16 @@ impl SecurityManager {
         }
 
         Ok(())
+    }
+
+    pub fn extract_model_id<'a>(ticket: &'a str) -> Result<&'a str, AetherError> {
+        let (model_id, _, _, _) = Self::split_ticket_payload(ticket)?;
+        Ok(model_id)
+    }
+
+    pub fn extract_issuer_peer_id<'a>(ticket: &'a str) -> Result<&'a str, AetherError> {
+        let (_, _, _, issuer) = Self::split_ticket_payload(ticket)?;
+        Ok(issuer)
     }
 
     /// Generate a signed ticket for outbound requests.

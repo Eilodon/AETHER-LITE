@@ -24,7 +24,9 @@ fn sha256_hex(data: &[u8]) -> String {
 /// Required since start_server() now enforces that the key is non-empty.
 fn new_engine_with_identity() -> aether_core::AetherEngine {
     let engine = aether_core::AetherEngine::new();
-    engine.set_self_identity_public_key(vec![0x04u8; 65]).unwrap();
+    engine
+        .set_self_identity_public_key(vec![0x04u8; 65])
+        .unwrap();
     engine
 }
 
@@ -49,7 +51,8 @@ mod security_tests {
     #[test]
     fn generate_and_verify_ticket() {
         let secret = key(0x42);
-        let ticket = SecurityManager::generate_ticket("llm-mini", "2.0", "seeder-1", &secret).unwrap();
+        let ticket =
+            SecurityManager::generate_ticket("llm-mini", "2.0", "seeder-1", &secret).unwrap();
         assert!(SecurityManager::verify_ticket(&ticket, &secret).is_ok());
     }
 
@@ -554,9 +557,13 @@ mod hkdf_tests {
         // The stored key is derived, so generate a ticket using the *derived* key
         // to confirm the engine verifies tickets correctly against its stored key.
         let derived = SecurityManager::derive_hmac_key(&raw_secret).unwrap();
-        let ticket =
-            SecurityManager::generate_ticket("model-x", "1.0", "seeder-1", &SecureKey(derived.to_vec()))
-                .unwrap();
+        let ticket = SecurityManager::generate_ticket(
+            "model-x",
+            "1.0",
+            "seeder-1",
+            &SecureKey(derived.to_vec()),
+        )
+        .unwrap();
 
         // Verify via the download handler path (which calls verify_ticket internally)
         // is hard to test without a real server; verify at the SecurityManager level.
@@ -602,9 +609,13 @@ mod seeder_tests {
 
         // ── 3. Build a valid ticket for the leecher ───────────────────────────
         let derived = SecurityManager::derive_hmac_key(&raw_secret).unwrap();
-        let ticket =
-            SecurityManager::generate_ticket(model_id, "1.0", "seeder-1", &SecureKey(derived.to_vec()))
-                .unwrap();
+        let ticket = SecurityManager::generate_ticket(
+            model_id,
+            "1.0",
+            "seeder-1",
+            &SecureKey(derived.to_vec()),
+        )
+        .unwrap();
 
         // ── 4. Download via leecher engine ────────────────────────────────────
         let leecher = AetherEngine::new();
@@ -669,9 +680,13 @@ mod seeder_tests {
         std::thread::sleep(std::time::Duration::from_millis(60));
 
         let derived = SecurityManager::derive_hmac_key(&raw_secret).unwrap();
-        let ticket =
-            SecurityManager::generate_ticket("trunc-model", "1.0", "seeder-1", &SecureKey(derived.to_vec()))
-                .unwrap();
+        let ticket = SecurityManager::generate_ticket(
+            "trunc-model",
+            "1.0",
+            "seeder-1",
+            &SecureKey(derived.to_vec()),
+        )
+        .unwrap();
 
         // Pre-fill output file with more bytes than the payload.
         let out_f = NamedTempFile::new().unwrap();
@@ -776,8 +791,8 @@ mod seeder_tests {
                     sha256_hex(&full_payload), // full-file SHA
                     512,                       // resume_from = 512 bytes already on disk
                     out_fd,
-            )
-            .unwrap();
+                )
+                .unwrap();
         }
 
         let result = std::fs::read(out_f.path()).unwrap();
@@ -814,9 +829,13 @@ mod seeder_tests {
         std::thread::sleep(std::time::Duration::from_millis(60));
 
         let derived = SecurityManager::derive_hmac_key(&raw_secret).unwrap();
-        let ticket =
-            SecurityManager::generate_ticket("llm-pro", "1.0", "seeder-1", &SecureKey(derived.to_vec()))
-                .unwrap();
+        let ticket = SecurityManager::generate_ticket(
+            "llm-pro",
+            "1.0",
+            "seeder-1",
+            &SecureKey(derived.to_vec()),
+        )
+        .unwrap();
 
         let leecher = AetherEngine::new();
         leecher.set_self_peer_id("peer-basic".into());
@@ -899,11 +918,17 @@ mod seeder_tests {
         // seeder.stop_server();  // ← skipped: mirrors guarded startSeederNode
 
         // Step 2: register file
-        seeder.register_file_for_serving(model_id.into(), serve_f.path().to_str().unwrap().into()).unwrap();
+        seeder
+            .register_file_for_serving(model_id.into(), serve_f.path().to_str().unwrap().into())
+            .unwrap();
 
         // Step 3: register peer key + grant access
-        seeder.register_peer_key("leecher-flow".into(), raw_secret.clone()).unwrap();
-        seeder.grant_peer_model_access("leecher-flow".into(), model_id.into()).unwrap();
+        seeder
+            .register_peer_key("leecher-flow".into(), raw_secret.clone())
+            .unwrap();
+        seeder
+            .grant_peer_model_access("leecher-flow".into(), model_id.into())
+            .unwrap();
 
         // Step 4: start server
         let port = seeder.start_server().unwrap();
@@ -912,21 +937,41 @@ mod seeder_tests {
         // Build ticket for leecher
         let derived = SecurityManager::derive_hmac_key(&raw_secret).unwrap();
         let ticket = SecurityManager::generate_ticket(
-            model_id, "1.0", "seeder-1", &SecureKey(derived.to_vec()),
-        ).unwrap();
+            model_id,
+            "1.0",
+            "seeder-1",
+            &SecureKey(derived.to_vec()),
+        )
+        .unwrap();
 
         // Leecher downloads
         let leecher = AetherEngine::new();
         leecher.set_self_peer_id("leecher-flow".into());
-        leecher.register_peer_key("seeder-1".into(), raw_secret.clone()).unwrap();
+        leecher
+            .register_peer_key("seeder-1".into(), raw_secret.clone())
+            .unwrap();
 
         let out_f = NamedTempFile::new().unwrap();
         let expected = sha256_hex(payload);
         let out_fd = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true)
-            .open(out_f.path()).unwrap().into_raw_fd();
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(out_f.path())
+            .unwrap()
+            .into_raw_fd();
 
-        leecher.download_model("127.0.0.1".into(), port, "seeder-1".into(), ticket, expected.clone(), 0, out_fd).unwrap();
+        leecher
+            .download_model(
+                "127.0.0.1".into(),
+                port,
+                "seeder-1".into(),
+                ticket,
+                expected.clone(),
+                0,
+                out_fd,
+            )
+            .unwrap();
 
         let downloaded = std::fs::read(out_f.path()).unwrap();
         assert_eq!(downloaded, payload, "Downloaded bytes must match original");
@@ -946,46 +991,96 @@ mod seeder_tests {
         let model_id = "reregister-model";
         let raw_secret = vec![0xDDu8; 32];
 
-        seeder.register_file_for_serving(model_id.into(), serve_v1.path().to_str().unwrap().into()).unwrap();
-        seeder.register_peer_key("leecher-re".into(), raw_secret.clone()).unwrap();
-        seeder.grant_peer_model_access("leecher-re".into(), model_id.into()).unwrap();
+        seeder
+            .register_file_for_serving(model_id.into(), serve_v1.path().to_str().unwrap().into())
+            .unwrap();
+        seeder
+            .register_peer_key("leecher-re".into(), raw_secret.clone())
+            .unwrap();
+        seeder
+            .grant_peer_model_access("leecher-re".into(), model_id.into())
+            .unwrap();
 
         let port1 = seeder.start_server().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(60));
 
         let derived = SecurityManager::derive_hmac_key(&raw_secret).unwrap();
         let ticket1 = SecurityManager::generate_ticket(
-            model_id, "1.0", "seeder-1", &SecureKey(derived.to_vec()),
-        ).unwrap();
+            model_id,
+            "1.0",
+            "seeder-1",
+            &SecureKey(derived.to_vec()),
+        )
+        .unwrap();
 
         let leecher = AetherEngine::new();
         leecher.set_self_peer_id("leecher-re".into());
-        leecher.register_peer_key("seeder-1".into(), raw_secret.clone()).unwrap();
+        leecher
+            .register_peer_key("seeder-1".into(), raw_secret.clone())
+            .unwrap();
 
         let out1 = NamedTempFile::new().unwrap();
         let out1_fd = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true)
-            .open(out1.path()).unwrap().into_raw_fd();
-        leecher.download_model("127.0.0.1".into(), port1, "seeder-1".into(), ticket1, sha256_hex(payload_v1), 0, out1_fd).unwrap();
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(out1.path())
+            .unwrap()
+            .into_raw_fd();
+        leecher
+            .download_model(
+                "127.0.0.1".into(),
+                port1,
+                "seeder-1".into(),
+                ticket1,
+                sha256_hex(payload_v1),
+                0,
+                out1_fd,
+            )
+            .unwrap();
         assert_eq!(std::fs::read(out1.path()).unwrap(), payload_v1);
 
         // Re-register (startSeederNode sequence)
         seeder.stop_server();
         std::thread::sleep(std::time::Duration::from_millis(100));
-        seeder.register_file_for_serving(model_id.into(), serve_v2.path().to_str().unwrap().into()).unwrap();
+        seeder
+            .register_file_for_serving(model_id.into(), serve_v2.path().to_str().unwrap().into())
+            .unwrap();
         let port2 = seeder.start_server().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Use version "2.0" to produce a distinct ticket nonce (avoids replay rejection)
         let ticket2 = SecurityManager::generate_ticket(
-            model_id, "2.0", "seeder-1", &SecureKey(derived.to_vec()),
-        ).unwrap();
+            model_id,
+            "2.0",
+            "seeder-1",
+            &SecureKey(derived.to_vec()),
+        )
+        .unwrap();
         let out2 = NamedTempFile::new().unwrap();
         let out2_fd = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true)
-            .open(out2.path()).unwrap().into_raw_fd();
-        leecher.download_model("127.0.0.1".into(), port2, "seeder-1".into(), ticket2, sha256_hex(payload_v2), 0, out2_fd).unwrap();
-        assert_eq!(std::fs::read(out2.path()).unwrap(), payload_v2, "Re-registered model must serve new file");
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(out2.path())
+            .unwrap()
+            .into_raw_fd();
+        leecher
+            .download_model(
+                "127.0.0.1".into(),
+                port2,
+                "seeder-1".into(),
+                ticket2,
+                sha256_hex(payload_v2),
+                0,
+                out2_fd,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(out2.path()).unwrap(),
+            payload_v2,
+            "Re-registered model must serve new file"
+        );
         seeder.stop_server();
     }
 
@@ -1003,9 +1098,15 @@ mod seeder_tests {
         let raw_secret = vec![0xEEu8; 32];
 
         // Initial start
-        seeder.register_file_for_serving(model_id.into(), serve_v1.path().to_str().unwrap().into()).unwrap();
-        seeder.register_peer_key("leecher-rst".into(), raw_secret.clone()).unwrap();
-        seeder.grant_peer_model_access("leecher-rst".into(), model_id.into()).unwrap();
+        seeder
+            .register_file_for_serving(model_id.into(), serve_v1.path().to_str().unwrap().into())
+            .unwrap();
+        seeder
+            .register_peer_key("leecher-rst".into(), raw_secret.clone())
+            .unwrap();
+        seeder
+            .grant_peer_model_access("leecher-rst".into(), model_id.into())
+            .unwrap();
 
         let port1 = seeder.start_server().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1013,37 +1114,81 @@ mod seeder_tests {
         // Download v1
         let derived = SecurityManager::derive_hmac_key(&raw_secret).unwrap();
         let ticket1 = SecurityManager::generate_ticket(
-            model_id, "1.0", "seeder-1", &SecureKey(derived.to_vec()),
-        ).unwrap();
+            model_id,
+            "1.0",
+            "seeder-1",
+            &SecureKey(derived.to_vec()),
+        )
+        .unwrap();
 
         let leecher = AetherEngine::new();
         leecher.set_self_peer_id("leecher-rst".into());
-        leecher.register_peer_key("seeder-1".into(), raw_secret.clone()).unwrap();
+        leecher
+            .register_peer_key("seeder-1".into(), raw_secret.clone())
+            .unwrap();
 
         let out1 = NamedTempFile::new().unwrap();
         let out1_fd = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true)
-            .open(out1.path()).unwrap().into_raw_fd();
-        leecher.download_model("127.0.0.1".into(), port1, "seeder-1".into(), ticket1, sha256_hex(payload_v1), 0, out1_fd).unwrap();
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(out1.path())
+            .unwrap()
+            .into_raw_fd();
+        leecher
+            .download_model(
+                "127.0.0.1".into(),
+                port1,
+                "seeder-1".into(),
+                ticket1,
+                sha256_hex(payload_v1),
+                0,
+                out1_fd,
+            )
+            .unwrap();
         assert_eq!(std::fs::read(out1.path()).unwrap(), payload_v1);
 
         // ── startSeederNode: stop → reregister → restart ────────────────────
         seeder.stop_server();
         std::thread::sleep(std::time::Duration::from_millis(100));
-        seeder.register_file_for_serving(model_id.into(), serve_v2.path().to_str().unwrap().into()).unwrap();
+        seeder
+            .register_file_for_serving(model_id.into(), serve_v2.path().to_str().unwrap().into())
+            .unwrap();
         let port2 = seeder.start_server().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Download v2 with a fresh ticket (different version to avoid replay)
         let ticket2 = SecurityManager::generate_ticket(
-            model_id, "2.0", "seeder-1", &SecureKey(derived.to_vec()),
-        ).unwrap();
+            model_id,
+            "2.0",
+            "seeder-1",
+            &SecureKey(derived.to_vec()),
+        )
+        .unwrap();
         let out2 = NamedTempFile::new().unwrap();
         let out2_fd = std::fs::OpenOptions::new()
-            .write(true).create(true).truncate(true)
-            .open(out2.path()).unwrap().into_raw_fd();
-        leecher.download_model("127.0.0.1".into(), port2, "seeder-1".into(), ticket2, sha256_hex(payload_v2), 0, out2_fd).unwrap();
-        assert_eq!(std::fs::read(out2.path()).unwrap(), payload_v2, "Restarted seeder must serve new file");
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(out2.path())
+            .unwrap()
+            .into_raw_fd();
+        leecher
+            .download_model(
+                "127.0.0.1".into(),
+                port2,
+                "seeder-1".into(),
+                ticket2,
+                sha256_hex(payload_v2),
+                0,
+                out2_fd,
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::read(out2.path()).unwrap(),
+            payload_v2,
+            "Restarted seeder must serve new file"
+        );
         seeder.stop_server();
     }
 }

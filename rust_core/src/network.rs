@@ -210,7 +210,8 @@ pub async fn download_file_to_fd(
     // Parse the random nonce from the X-Aether-Nonce response header.
     // The seeder generates a fresh random nonce per session, eliminating
     // keystream-reuse risk even if the same ticket is replayed after restart.
-    let nonce_bytes: [u8; 12] = resp.nonce_hex
+    let nonce_bytes: [u8; 12] = resp
+        .nonce_hex
         .as_deref()
         .and_then(|h| hex::decode(h).ok())
         .filter(|b| b.len() == 12)
@@ -219,20 +220,18 @@ pub async fn download_file_to_fd(
             arr.copy_from_slice(&b);
             Some(arr)
         })
-        .ok_or_else(|| AetherError::SecurityError(
-            "Missing or invalid X-Aether-Nonce header from seeder".into()
-        ))?;
+        .ok_or_else(|| {
+            AetherError::SecurityError(
+                "Missing or invalid X-Aether-Nonce header from seeder".into(),
+            )
+        })?;
 
     let mut async_file = tokio::fs::File::from_std(file);
     let mut hasher = Sha256::new();
     let mut written = 0u64;
     // Extract model_id from ticket payload for HKDF salt (not the ticket itself).
     // Ticket format: <model_id>|<version>|<timestamp>|<issuer_peer_id>.<HMAC>
-    let model_id = ticket
-        .rsplit_once('.')
-        .map(|(payload, _)| payload)
-        .and_then(|payload| payload.split('|').next())
-        .ok_or_else(|| AetherError::SecurityError("Cannot extract model_id from ticket".into()))?;
+    let model_id = SecurityManager::extract_model_id(&ticket)?;
     let session_key = SecurityManager::derive_session_stream_key(&transport_key, model_id)?;
     let mut cipher = ChaCha20::new((&session_key).into(), (&nonce_bytes).into());
     cipher.seek(resume_from);

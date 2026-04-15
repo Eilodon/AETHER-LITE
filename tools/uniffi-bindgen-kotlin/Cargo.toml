@@ -1,0 +1,10 @@
+[package]
+name = "uniffi-bindgen-kotlin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+camino = "1.1"
+uniffi_bindgen = "=0.26.1"

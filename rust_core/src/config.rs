@@ -1,6 +1,11 @@
 // rust_core/src/config.rs
 pub struct Config;
 
+static HEADER_KEY: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| obfstr::obfstr!("X-Aether-Auth").to_string());
+static PROTOCOL_VERSION: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| obfstr::obfstr!("v2.3-swarm-fixed").to_string());
+
 impl Config {
     /// Bind all interfaces; OS picks an available port.
     pub const BIND_ADDRESS: &'static str = "0.0.0.0:0";
@@ -26,6 +31,12 @@ impl Config {
     /// Maximum concurrent downloads allowed per peer to prevent DoS.
     pub const MAX_DOWNLOADS_PER_PEER: usize = 3;
 
+    /// Idle TTL for per-peer limiter entries before background cleanup.
+    pub const PEER_LIMITER_IDLE_TTL_SECS: u64 = 15 * 60;
+
+    /// Background cleanup cadence for in-memory eviction tasks.
+    pub const BACKGROUND_CLEANUP_INTERVAL_SECS: u64 = 30;
+
     /// Current bspatch pipeline buffers the old file and patch delta in RAM.
     /// Keep the combined input under this ceiling to avoid OOM on low-RAM devices.
     pub const MAX_PATCH_BUFFERED_INPUT_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
@@ -40,12 +51,12 @@ impl Config {
     /// Obfuscated auth header name.
     #[inline(always)]
     pub fn get_header_key() -> &'static str {
-        "X-Aether-Auth"
+        HEADER_KEY.as_str()
     }
 
     /// Obfuscated protocol version string.
     #[inline(always)]
     pub fn get_protocol_version() -> &'static str {
-        "v2.3-swarm-fixed"
+        PROTOCOL_VERSION.as_str()
     }
 }

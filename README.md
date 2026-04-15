@@ -8,7 +8,7 @@
 
 Transfer a 10 GB AI model to a device with 512 MB RAM. Resume after network loss. Apply a 50 MB patch instead of re-downloading 1 GB. All verified with SHA-256. All authenticated with HMAC-SHA256 backed by hardware security chips.
 
-Current threat model: integrity checks are mandatory and enforced in Rust. The mobile SDK now supports peer-pin persistence, TOFU-first handshake, and QR payload onboarding for authenticated ECDH, but discovery and camera/UI orchestration still belong to the embedding app. File bytes are session-encrypted after handshake, but HTTP metadata and control flow remain visible on the LAN unless you add TLS/Noise above it.
+Current threat model: integrity checks are mandatory and enforced in Rust. The mobile SDK now supports peer-pin persistence and QR payload onboarding for authenticated ECDH, but discovery and camera/UI orchestration still belong to the embedding app. Plaintext `/identity` bootstrap now requires an existing pin or an out-of-band verified fingerprint; unauthenticated TOFU over HTTP is intentionally disabled. File bytes are session-encrypted after handshake, but HTTP metadata and control flow remain visible on the LAN unless you add TLS/Noise above it.
 
 ---
 

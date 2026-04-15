@@ -2,6 +2,7 @@ package com.b_one.aether.security
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.util.Log
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 import org.json.JSONObject
@@ -170,6 +171,28 @@ object PeerTrust {
         )
     }
 
+    fun pinnedDecisionFromVerifiedFingerprint(
+        peerId: String,
+        publicKeyHex: String,
+        protocolVersion: String,
+        nowEpochMs: Long = System.currentTimeMillis()
+    ): PeerTrustDecision {
+        val normalizedKeyHex = publicKeyHex.lowercase()
+        val fingerprint = fingerprintHex(hexToBytes(normalizedKeyHex))
+        return PeerTrustDecision(
+            pin = PeerPin(
+                peerId = peerId,
+                publicKeyHex = normalizedKeyHex,
+                publicKeySha256 = fingerprint,
+                protocolVersion = protocolVersion,
+                trustMode = PeerTrustMode.QR_PINNED,
+                addedAtEpochMs = nowEpochMs,
+                lastValidatedAtEpochMs = nowEpochMs
+            ),
+            trustEstablishedNow = true
+        )
+    }
+
     fun hexToBytes(hex: String): ByteArray {
         require(hex.length % 2 == 0) { "Hex string must have even length" }
         return ByteArray(hex.length / 2) { i ->
@@ -179,6 +202,9 @@ object PeerTrust {
 }
 
 class PeerPinStore(context: Context) {
+    companion object {
+        private const val TAG = "PeerPinStore"
+    }
     // ADR-008: EncryptedSharedPreferences replaces plaintext SharedPreferences.
     // Implements the same SharedPreferences interface — read/write code unchanged.
     private val prefs: SharedPreferences = EncryptedSharedPreferences.create(
@@ -197,7 +223,9 @@ class PeerPinStore(context: Context) {
 
     fun get(peerId: String): PeerPin? {
         val raw = prefs.getString(key(peerId), null) ?: return null
-        return runCatching { decode(raw) }.getOrNull()
+        return runCatching { decode(raw) }
+            .onFailure { Log.w(TAG, "Ignoring unreadable encrypted peer pin for $peerId", it) }
+            .getOrNull()
     }
 
     fun save(pin: PeerPin) {
@@ -264,7 +292,9 @@ class PeerPinStore(context: Context) {
         val editor = prefs.edit()
         for ((k, v) in oldPrefs.all) {
             if (k.startsWith("peer_pin:") && v is String) {
-                editor.putString(k, v)
+                runCatching { decode(v) }
+                    .onSuccess { editor.putString(k, v) }
+                    .onFailure { Log.w(TAG, "Skipping invalid plaintext peer pin during migration: $k", it) }
             }
         }
         editor.apply()

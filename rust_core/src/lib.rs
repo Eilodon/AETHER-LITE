@@ -38,13 +38,16 @@ use axum::{
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
 use dashmap::DashMap;
+use futures_util::stream::{self, BoxStream};
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::runtime::Runtime;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::runtime::Runtime;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -64,7 +67,7 @@ struct AppState {
     /// Limits concurrent download sessions to prevent resource exhaustion.
     download_limiter: Arc<Semaphore>,
     /// Per-peer download limiters to prevent a single peer from exhausting slots.
-    peer_limiters: DashMap<String, Arc<Semaphore>>,
+    peer_limiters: DashMap<String, PeerLimiterEntry>,
     /// Files registered for serving by model_id → absolute path on disk.
     /// Populated by `register_file_for_serving` before a peer connects.
     serve_files: DashMap<String, PathBuf>,
@@ -74,6 +77,30 @@ struct AppState {
 struct PeerKeys {
     auth_key: SecureKey,
     transport_key: SecureKey,
+}
+
+struct PeerLimiterEntry {
+    semaphore: Arc<Semaphore>,
+    last_seen_unix_secs: AtomicU64,
+}
+
+impl PeerLimiterEntry {
+    fn new(now: u64) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(Config::MAX_DOWNLOADS_PER_PEER)),
+            last_seen_unix_secs: AtomicU64::new(now),
+        }
+    }
+
+    fn touch(&self, now: u64) {
+        self.last_seen_unix_secs.store(now, Ordering::Relaxed);
+    }
+
+    fn is_idle_expired(&self, now: u64) -> bool {
+        let last_seen = self.last_seen_unix_secs.load(Ordering::Relaxed);
+        now.saturating_sub(last_seen) > Config::PEER_LIMITER_IDLE_TTL_SECS
+            && self.semaphore.available_permits() == Config::MAX_DOWNLOADS_PER_PEER
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -146,7 +173,10 @@ impl AetherEngine {
         *self.self_peer_id.write().unwrap() = peer_id;
     }
 
-    pub fn set_self_identity_public_key(&self, public_key_x962: Vec<u8>) -> Result<(), AetherError> {
+    pub fn set_self_identity_public_key(
+        &self,
+        public_key_x962: Vec<u8>,
+    ) -> Result<(), AetherError> {
         if public_key_x962.len() != 65 || public_key_x962.first().copied() != Some(0x04) {
             return Err(AetherError::KeyExchangeFailed);
         }
@@ -185,9 +215,9 @@ impl AetherEngine {
             let state = ServerState {
                 app: app_state,
                 identity: Arc::new(IdentityState {
-                peer_id: self_peer_id.read().unwrap().clone(),
-                public_key_hex: hex::encode(self_public_key_x962.read().unwrap().clone()),
-                protocol_version: Config::get_protocol_version().to_string(),
+                    peer_id: self_peer_id.read().unwrap().clone(),
+                    public_key_hex: hex::encode(self_public_key_x962.read().unwrap().clone()),
+                    protocol_version: Config::get_protocol_version().to_string(),
                 }),
             };
             let app = Router::new()
@@ -223,11 +253,14 @@ impl AetherEngine {
             loop {
                 tokio::select! {
                     _ = eviction_child.cancelled() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    _ = tokio::time::sleep(Duration::from_secs(Config::BACKGROUND_CLEANUP_INTERVAL_SECS)) => {
                         let now = current_unix_secs();
                         let ttl = Config::TICKET_REPLAY_TTL_SECS;
                         eviction_state.seen_tickets
                             .retain(|_, seen_at| now.saturating_sub(*seen_at) <= ttl);
+                        eviction_state
+                            .peer_limiters
+                            .retain(|_, entry| !entry.is_idle_expired(now));
                     }
                 }
             }
@@ -336,6 +369,7 @@ impl AetherEngine {
     pub fn revoke_peer(&self, peer_id: String) -> Result<(), AetherError> {
         let had_keys = self.state.peer_keys.remove(&peer_id).is_some();
         let had_perms = self.state.peer_permissions.remove(&peer_id).is_some();
+        let _ = self.state.peer_limiters.remove(&peer_id);
         if !had_keys && !had_perms {
             return Err(AetherError::PeerNotFound);
         }
@@ -400,12 +434,7 @@ impl AetherEngine {
 
         // Only AFTER HMAC verification is it safe to parse the ticket.
         // Validate that the issuer in the ticket matches the expected seeder.
-        let issuer_peer_id = ticket
-            .rsplit_once('.')
-            .map(|(payload, _)| payload)
-            .and_then(|payload| payload.split('|').nth(3))
-            .ok_or(AetherError::InvalidTicket)?
-            .to_string();
+        let issuer_peer_id = SecurityManager::extract_issuer_peer_id(&ticket)?.to_string();
         if issuer_peer_id != seeder_peer_id {
             return Err(AetherError::SecurityError(
                 "Ticket issuer does not match expected seeder peer ID".into(),
@@ -545,12 +574,16 @@ async fn download_handler(
 
     // ── Per-peer rate limit ─────────────────────────────────────────────────
     // SECURITY: Prevent a single peer from exhausting all global download slots
-    let peer_limiter = state
-        .app
-        .peer_limiters
-        .entry(peer_id.clone())
-        .or_insert_with(|| Arc::new(Semaphore::new(Config::MAX_DOWNLOADS_PER_PEER)))
-        .clone();
+    let now = current_unix_secs();
+    let peer_limiter = {
+        let entry = state
+            .app
+            .peer_limiters
+            .entry(peer_id.clone())
+            .or_insert_with(|| PeerLimiterEntry::new(now));
+        entry.touch(now);
+        entry.semaphore.clone()
+    };
     let _peer_permit = match peer_limiter.try_acquire() {
         Ok(p) => p,
         Err(_) => {
@@ -581,7 +614,9 @@ async fn download_handler(
             if !peer_major.is_empty() && local_major != peer_major {
                 tracing::warn!(
                     "Protocol mismatch from peer {}: local={} peer={}",
-                    peer_id, local, peer_ver
+                    peer_id,
+                    local,
+                    peer_ver
                 );
                 return (StatusCode::BAD_REQUEST, "Incompatible protocol version").into_response();
             }
@@ -603,13 +638,9 @@ async fn download_handler(
     }
 
     // Extract model_id only after the ticket has been authenticated.
-    let model_id = match ticket_str
-        .rsplit_once('.')
-        .map(|(payload, _)| payload)
-        .and_then(|payload| payload.split('|').next())
-    {
-        Some(model_id) if !model_id.is_empty() => model_id.to_string(),
-        _ => return (StatusCode::BAD_REQUEST, "Malformed ticket payload").into_response(),
+    let model_id = match SecurityManager::extract_model_id(&ticket_str) {
+        Ok(model_id) => model_id.to_string(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "Malformed ticket payload").into_response(),
     };
 
     let allowed = match state.app.peer_permissions.get(&peer_id) {
@@ -752,15 +783,16 @@ fn encrypted_file_stream(
     nonce: &[u8; 12],
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     // Extract model_id from ticket for HKDF salt (not the ticket itself).
-    let model_id = ticket
-        .rsplit_once('.')
-        .map(|(payload, _)| payload)
-        .and_then(|payload| payload.split('|').next())
-        .unwrap_or("")
-        .to_string();
+    let model_id = match SecurityManager::extract_model_id(ticket) {
+        Ok(model_id) => model_id.to_string(),
+        Err(e) => {
+            let err = std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string());
+            return stream::once(async move { Err(err) }).boxed();
+        }
+    };
     let transport_key = transport_key.clone();
     let nonce = *nonce;
-    try_stream! {
+    let stream: BoxStream<'static, Result<Bytes, std::io::Error>> = try_stream! {
         let session_key = SecurityManager::derive_session_stream_key(&transport_key, &model_id)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         let mut cipher = ChaCha20::new((&session_key).into(), (&nonce).into());
@@ -781,6 +813,8 @@ fn encrypted_file_stream(
             yield Bytes::from(chunk);
         }
     }
+    .boxed();
+    stream
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -809,7 +843,10 @@ mod tests {
         let canonical = engine
             .canonicalize_json(r#"{"z":"last","a":"first","full":{"url":"x","size":1}}"#.into())
             .unwrap();
-        assert_eq!(canonical, r#"{"a":"first","full":{"size":1,"url":"x"},"z":"last"}"#);
+        assert_eq!(
+            canonical,
+            r#"{"a":"first","full":{"size":1,"url":"x"},"z":"last"}"#
+        );
     }
 
     #[test]
@@ -861,7 +898,9 @@ mod tests {
     #[test]
     fn heartbeat_ok_after_server_starts() {
         let engine = AetherEngine::new();
-        engine.set_self_identity_public_key(vec![0x04u8; 65]).unwrap();
+        engine
+            .set_self_identity_public_key(vec![0x04u8; 65])
+            .unwrap();
         engine.start_server().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(engine.heartbeat().is_ok());
@@ -871,7 +910,9 @@ mod tests {
     #[test]
     fn heartbeat_fails_after_server_stops() {
         let engine = AetherEngine::new();
-        engine.set_self_identity_public_key(vec![0x04u8; 65]).unwrap();
+        engine
+            .set_self_identity_public_key(vec![0x04u8; 65])
+            .unwrap();
         engine.start_server().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
         engine.stop_server();
@@ -902,7 +943,10 @@ mod tests {
         let digest = hex::encode(Sha256::digest(ticket.as_bytes()));
 
         // Insert with expired timestamp
-        seen.insert(digest.clone(), current_unix_secs() - Config::TICKET_REPLAY_TTL_SECS - 1);
+        seen.insert(
+            digest.clone(),
+            current_unix_secs() - Config::TICKET_REPLAY_TTL_SECS - 1,
+        );
 
         // Same ticket should be allowed (expired → treated as fresh)
         assert!(reject_replayed_ticket(&seen, ticket).is_ok());
@@ -954,8 +998,15 @@ mod tests {
             .unwrap()
             .into_raw_fd();
 
-        let result =
-            engine.download_model("127.0.0.1".into(), 1, "unknown-seeder".into(), "ticket".into(), "".into(), 0, fd);
+        let result = engine.download_model(
+            "127.0.0.1".into(),
+            1,
+            "unknown-seeder".into(),
+            "ticket".into(),
+            "".into(),
+            0,
+            fd,
+        );
         let _ = unsafe { std::fs::File::from_raw_fd(fd) };
         assert!(matches!(result, Err(AetherError::SecurityError(_))));
     }
@@ -965,8 +1016,12 @@ mod tests {
     fn revoke_peer_removes_keys_and_permissions() {
         let engine = AetherEngine::new();
         let secret = vec![0xAAu8; 32];
-        engine.register_peer_key("peer-a".into(), secret.clone()).unwrap();
-        engine.grant_peer_model_access("peer-a".into(), "model-x".into()).unwrap();
+        engine
+            .register_peer_key("peer-a".into(), secret.clone())
+            .unwrap();
+        engine
+            .grant_peer_model_access("peer-a".into(), "model-x".into())
+            .unwrap();
 
         // Peer exists before revocation
         assert!(engine.state.peer_keys.contains_key("peer-a"));
@@ -991,7 +1046,9 @@ mod tests {
     #[test]
     fn is_server_running_reflects_bound_port() {
         let engine = AetherEngine::new();
-        engine.set_self_identity_public_key(vec![0x04u8; 65]).unwrap();
+        engine
+            .set_self_identity_public_key(vec![0x04u8; 65])
+            .unwrap();
         assert!(!engine.is_server_running());
         let _port = engine.start_server().unwrap();
         assert!(engine.is_server_running());
@@ -1004,7 +1061,10 @@ mod tests {
     #[test]
     fn get_protocol_version_returns_config_value() {
         let engine = AetherEngine::new();
-        assert_eq!(engine.get_protocol_version(), Config::get_protocol_version());
+        assert_eq!(
+            engine.get_protocol_version(),
+            Config::get_protocol_version()
+        );
     }
 
     /// validate_peer_protocol accepts same major, rejects different major and blank.
@@ -1012,7 +1072,9 @@ mod tests {
     fn validate_peer_protocol_accepts_same_major() {
         let engine = AetherEngine::new();
         // Same version → OK
-        assert!(engine.validate_peer_protocol("v2.3-swarm-fixed".into()).is_ok());
+        assert!(engine
+            .validate_peer_protocol("v2.3-swarm-fixed".into())
+            .is_ok());
         // Same major, different minor → OK
         assert!(engine.validate_peer_protocol("v2.4-beta".into()).is_ok());
     }
@@ -1045,7 +1107,9 @@ mod tests {
     #[test]
     fn stop_server_on_fresh_engine_does_not_poison_start() {
         let engine = AetherEngine::new();
-        engine.set_self_identity_public_key(vec![0x04u8; 65]).unwrap();
+        engine
+            .set_self_identity_public_key(vec![0x04u8; 65])
+            .unwrap();
 
         // Call stop_server() on a fresh engine (no server running).
         // This used to poison Notify with notify_one(), causing the next
@@ -1053,13 +1117,18 @@ mod tests {
         engine.stop_server();
 
         // Now start the server — it must succeed and stay alive.
-        let port = engine.start_server().expect("start_server must succeed after stop_server on fresh engine");
+        let port = engine
+            .start_server()
+            .expect("start_server must succeed after stop_server on fresh engine");
         assert_ne!(port, 0);
 
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Heartbeat must pass — server is alive.
-        assert!(engine.heartbeat().is_ok(), "server must be alive after start_server following stop_server on fresh engine");
+        assert!(
+            engine.heartbeat().is_ok(),
+            "server must be alive after start_server following stop_server on fresh engine"
+        );
 
         engine.stop_server();
     }

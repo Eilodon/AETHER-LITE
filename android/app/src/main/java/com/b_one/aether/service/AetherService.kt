@@ -52,6 +52,7 @@ class AetherService : Service() {
 
         // Maximum consecutive heartbeat failures before service gives up.
         private const val MAX_HEARTBEAT_FAILURES = 5
+        private const val SERVER_RESTART_GRACE_MS = 250L
     }
 
     private val scope        = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -317,7 +318,7 @@ class AetherService : Service() {
                     if (consecutiveFailures >= MAX_HEARTBEAT_FAILURES) {
                         Log.e(TAG, "❌ Heartbeat exceeded max failures – restarting Rust core")
                         rustEngine.stopServer()
-                        delay(250)
+                        delay(SERVER_RESTART_GRACE_MS)
                         startRustServer()
                         consecutiveFailures = 0
                         delayMs = 5_000L
@@ -447,9 +448,9 @@ class AetherService : Service() {
                 if (rustEngine.isServerRunning()) {
                     rustEngine.stopServer()
                     // Poll until server is actually stopped (TCP socket released)
-                    repeat {
+                    while (rustEngine.isServerRunning()) {
                         delay(50)
-                    } while (rustEngine.isServerRunning())
+                    }
                 }
 
                 rustEngine.registerFileForServing(modelId = modelId, filePath = filePath)
@@ -502,13 +503,27 @@ class AetherService : Service() {
                         require(fingerprint == expectedPeerPublicKeySha256) { "Peer public key fingerprint mismatch" }
                     }
 
-                    val trustDecision = PeerTrust.evaluateHandshake(
-                        peerId = peerId,
-                        publicKeyHex = publicKeyHex,
-                        protocolVersion = peerProtocolVersion,
-                        existingPin = peerPinStore.get(peerId),
-                        trustOnFirstUse = trustOnFirstUse
-                    )
+                    val existingPin = peerPinStore.get(peerId)
+                    val trustDecision = when {
+                        existingPin != null -> PeerTrust.evaluateHandshake(
+                            peerId = peerId,
+                            publicKeyHex = publicKeyHex,
+                            protocolVersion = peerProtocolVersion,
+                            existingPin = existingPin,
+                            trustOnFirstUse = false
+                        )
+                        expectedPeerPublicKeySha256 != null -> PeerTrust.pinnedDecisionFromVerifiedFingerprint(
+                            peerId = peerId,
+                            publicKeyHex = publicKeyHex,
+                            protocolVersion = peerProtocolVersion
+                        )
+                        trustOnFirstUse -> throw SecurityException(
+                            "Plaintext /identity bootstrap requires an existing pin or expected peer fingerprint; TOFU over HTTP is disabled"
+                        )
+                        else -> throw SecurityException(
+                            "Peer is not pinned; complete QR onboarding or provide an expected peer fingerprint before using /identity"
+                        )
+                    }
 
                     val sharedSecret = SecureVault.performHandshake(publicKeyBytes)
                     rustEngine.registerPeerKey(peerId = peerId, sharedSecret = sharedSecret)

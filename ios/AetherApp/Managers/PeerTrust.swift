@@ -191,6 +191,31 @@ enum PeerTrust {
         )
     }
 
+    static func pinnedDecisionFromVerifiedFingerprint(
+        peerId: String,
+        publicKeyHex: String,
+        protocolVersion: String,
+        nowEpochMs: UInt64 = PeerPinStore.currentEpochMs()
+    ) throws -> PeerTrustDecision {
+        let normalizedKeyHex = publicKeyHex.lowercased()
+        guard let publicKeyData = Data(hexString: normalizedKeyHex) else {
+            throw PeerTrustError.fingerprintMismatch
+        }
+        let fingerprint = fingerprintHex(publicKeyData)
+        return PeerTrustDecision(
+            pin: PeerPin(
+                peerId: peerId,
+                publicKeyHex: normalizedKeyHex,
+                publicKeySha256: fingerprint,
+                protocolVersion: protocolVersion,
+                trustMode: .qrPinned,
+                addedAtEpochMs: nowEpochMs,
+                lastValidatedAtEpochMs: nowEpochMs
+            ),
+            trustEstablishedNow: true
+        )
+    }
+
     private static func canonicalJSONString(_ object: [String: String]) -> String {
         let keys = object.keys.sorted()
         let pairs = keys.map { key -> String in
@@ -315,6 +340,6 @@ final class PeerPinStore {
     }
 
     static func currentEpochMs() -> UInt64 {
-        UInt64(Date().timeIntervalSince1970 * 1000)
+        UInt64(max(0.0, Date().timeIntervalSince1970 * 1000))
     }
 }

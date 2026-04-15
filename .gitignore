@@ -1,5 +1,6 @@
 # Rust
 /rust_core/target/
+tools/uniffi-bindgen-kotlin/target/
 
 # Android
 android/.gradle/
