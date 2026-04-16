@@ -18,6 +18,7 @@ import AetherFFI
 final class AetherManager: ObservableObject {
 
     static let shared = AetherManager()
+    private static let manifestSequenceDefaultsKey = "aether.manifest.sequences"
 
     @Published private(set) var isNodeActive = false
     @Published private(set) var activePort: UInt16 = 0
@@ -319,18 +320,27 @@ final class AetherManager: ObservableObject {
         }
 
         // ── 1. Verify manifest signature ──────────────────────────────────────
-        let (payloadJson, signatureHex) = try parseManifest(manifestJson)
+        let manifest = try parseManifest(manifestJson)
+        let payloadJson = manifest.payloadJson
+        let signatureHex = manifest.signatureHex
         let canonicalJson = try engine.canonicalizeJson(json: payloadJson)
 
-        let valid = Vault.shared.verifyManifestSignature(
-            canonicalJson: canonicalJson,
-            signatureHex: signatureHex,
-            publicKeyDer: adminPublicKeyDer
-        )
-        guard valid else {
-            throw AetherError.SignatureVerificationFailed
+        let lastAccepted = UserDefaults.standard.object(forKey: Self.manifestSequenceDefaultsKey)
+            .flatMap { $0 as? [String: UInt64] }?[manifest.modelId] ?? 0
+        if lastAccepted > 0 {
+            try engine.seedManifestSequence(modelId: manifest.modelId, sequence: lastAccepted)
         }
-        print("✅ Manifest signature verified")
+        try engine.verifyManifestWithSequence(
+            modelId: manifest.modelId,
+            sequence: manifest.sequence,
+            canonicalJson: canonicalJson,
+            sigHex: signatureHex,
+            publicKeyDer: [UInt8](adminPublicKeyDer)
+        )
+        var sequences = UserDefaults.standard.dictionary(forKey: Self.manifestSequenceDefaultsKey) as? [String: UInt64] ?? [:]
+        sequences[manifest.modelId] = manifest.sequence
+        UserDefaults.standard.set(sequences, forKey: Self.manifestSequenceDefaultsKey)
+        print("✅ Manifest signature + sequence verified in Rust")
 
         // ── 2. ADR-003: Check available RAM before patching ───────────────────
         let oldSize = (try? FileManager.default.attributesOfItem(atPath: oldUrl.path)[.size] as? UInt64) ?? 0
@@ -472,8 +482,8 @@ final class AetherManager: ObservableObject {
 
     // ── Manifest JSON helpers ─────────────────────────────────────────────────
 
-    /// Parse manifest.json → (payloadJson, signatureHex)
-    private func parseManifest(_ json: String) throws -> (String, String) {
+    /// Parse manifest.json and extract the signed payload plus ADR-016 sequence metadata.
+    private func parseManifest(_ json: String) throws -> (payloadJson: String, signatureHex: String, modelId: String, sequence: UInt64) {
         guard let data = json.data(using: .utf8),
               let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let payload   = root["payload"]   as? [String: Any],
@@ -481,12 +491,23 @@ final class AetherManager: ObservableObject {
         else {
             throw AetherError.InternalError("Invalid manifest JSON")
         }
+        guard let modelId = payload["id"] as? String, !modelId.isEmpty else {
+            throw AetherError.SecurityError("Manifest model ID missing")
+        }
+        guard let sequenceNumber = payload["sequence"] as? NSNumber else {
+            throw AetherError.SecurityError("Manifest sequence missing (ADR-016)")
+        }
+        let sequence = sequenceNumber.uint64Value
+        guard sequence > 0 else {
+            throw AetherError.SecurityError("Manifest sequence must be > 0 (ADR-016)")
+        }
         let payloadData = try JSONSerialization.data(withJSONObject: payload, options: [])
         guard let payloadJson = String(data: payloadData, encoding: .utf8) else {
             throw AetherError.InternalError("Payload JSON encoding failed")
         }
-        return (payloadJson, signature)
+        return (payloadJson, signature, modelId, sequence)
     }
+
 }
 
 // ── AetherEngine seeder extension ────────────────────────────────────────────

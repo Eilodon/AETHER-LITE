@@ -49,6 +49,7 @@ class AetherService : Service() {
 
         const val ACTION_SERVER_STARTED = "com.b_one.aether.SERVER_STARTED"
         const val EXTRA_PORT            = "port"
+        private const val MANIFEST_SEQUENCE_PREFS = "aether_manifest_sequences"
 
         // Maximum consecutive heartbeat failures before service gives up.
         private const val MAX_HEARTBEAT_FAILURES = 5
@@ -244,20 +245,37 @@ class AetherService : Service() {
                 val manifest    = JSONObject(manifestJson)
                 val payload     = manifest.getJSONObject("payload")
                 val signatureHex = manifest.getString("signature")
+                val modelId = payload.getString("id")
+                val sequence = if (payload.has("sequence") && !payload.isNull("sequence")) {
+                    payload.getLong("sequence")
+                } else {
+                    throw SecurityException("Manifest sequence missing (ADR-016)")
+                }
+                require(sequence > 0L) { "Manifest sequence must be > 0 (ADR-016)" }
 
                 // Reconstruct canonical JSON (sorted keys, no whitespace)
                 val canonicalJson = rustEngine.canonicalizeJson(payload.toString())
 
-                val signatureValid = SecureVault.verifyManifestSignature(
-                    canonicalJson  = canonicalJson,
-                    signatureHex   = signatureHex,
-                    publicKeyBytes = adminPublicKey
-                )
-                if (!signatureValid) {
-                    Log.e(TAG, "❌ Manifest signature INVALID – aborting patch")
+                val prefs = getSharedPreferences(MANIFEST_SEQUENCE_PREFS, MODE_PRIVATE)
+                val lastAccepted = prefs.getLong(modelId, 0L)
+                if (lastAccepted > 0L) {
+                    rustEngine.seedManifestSequence(modelId, lastAccepted.toULong())
+                }
+                try {
+                    rustEngine.verifyManifestWithSequence(
+                        modelId = modelId,
+                        sequence = sequence.toULong(),
+                        canonicalJson = canonicalJson,
+                        sigHex = signatureHex,
+                        publicKeyDer = adminPublicKey
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "❌ Manifest verification failed – aborting patch", e)
+                    onError?.invoke(e)
                     return@launch
                 }
-                Log.i(TAG, "✅ Manifest signature verified")
+                prefs.edit().putLong(modelId, sequence).apply()
+                Log.i(TAG, "✅ Manifest signature + sequence verified in Rust")
 
                 // ── 2. Apply patch via Rust ───────────────────────────────────
                 Log.i(TAG, "🔪 Applying surgical patch…")
@@ -272,7 +290,7 @@ class AetherService : Service() {
                 val oldSize = oldFile.length()
                 val patchSize = patchFile.length()
                 try {
-                    rustEngine.checkPatchRamFeasibility(oldSize, patchSize)
+                    rustEngine.checkPatchRamFeasibility(oldSize.toULong(), patchSize.toULong())
                 } catch (e: Exception) {
                     Log.e(TAG, "❌ ADR-003: Insufficient RAM for patching (old=${oldSize}B, patch=${patchSize}B)", e)
                     onError?.invoke(e)

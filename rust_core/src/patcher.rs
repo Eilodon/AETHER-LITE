@@ -397,6 +397,6 @@ mod tests {
         );
 
         assert!(matches!(result, Err(AetherError::PatchError(_))));
-        assert!(result.unwrap_err().to_string().contains("Patch delta"));
+        assert_eq!(result.unwrap_err().to_string(), "Patch failed");
     }
 }

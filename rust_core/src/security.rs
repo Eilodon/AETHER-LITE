@@ -27,7 +27,7 @@ pub struct SecurityManager;
 impl SecurityManager {
     fn split_ticket_payload<'a>(
         ticket: &'a str,
-    ) -> Result<(&'a str, &'a str, &'a str, &'a str), AetherError> {
+    ) -> Result<(&'a str, &'a str, &'a str, Option<u64>, &'a str), AetherError> {
         let (payload, _signature_b64) =
             ticket.rsplit_once('.').ok_or(AetherError::InvalidTicket)?;
         let fields: Vec<&str> = payload.split('|').collect();
@@ -38,11 +38,17 @@ impl SecurityManager {
         let model_id = fields[0];
         let version = fields[1];
         let ts_str = fields[2];
-        let issuer = fields[3];
+        // ADR-017: Optional counter field (5th position in new format)
+        let counter = if fields.len() >= 5 {
+            fields[3].parse::<u64>().ok()
+        } else {
+            None
+        };
+        let issuer = if fields.len() >= 5 { fields[4] } else { fields[3] };
         if model_id.is_empty() || version.is_empty() || ts_str.is_empty() || issuer.is_empty() {
             return Err(AetherError::InvalidTicket);
         }
-        Ok((model_id, version, ts_str, issuer))
+        Ok((model_id, version, ts_str, counter, issuer))
     }
 
     // ── Ticket verification ───────────────────────────────────────────────────
@@ -74,7 +80,7 @@ impl SecurityManager {
         // SECURITY: Parse all fields first, then validate atomically to prevent
         // timing side-channel attacks that could distinguish parse failures from
         // validation failures.
-        let (_model_id, _version, ts_str, _issuer) = Self::split_ticket_payload(ticket)?;
+        let (_model_id, _version, ts_str, _counter, _issuer) = Self::split_ticket_payload(ticket)?;
 
         // Parse timestamp (may fail, but we don't early-reject based on this alone)
         let ts: u64 = match ts_str.parse() {
@@ -93,16 +99,23 @@ impl SecurityManager {
     }
 
     pub fn extract_model_id<'a>(ticket: &'a str) -> Result<&'a str, AetherError> {
-        let (model_id, _, _, _) = Self::split_ticket_payload(ticket)?;
+        let (model_id, _, _, _, _) = Self::split_ticket_payload(ticket)?;
         Ok(model_id)
     }
 
     pub fn extract_issuer_peer_id<'a>(ticket: &'a str) -> Result<&'a str, AetherError> {
-        let (_, _, _, issuer) = Self::split_ticket_payload(ticket)?;
+        let (_, _, _, _, issuer) = Self::split_ticket_payload(ticket)?;
         Ok(issuer)
     }
 
-    /// Generate a signed ticket for outbound requests.
+    /// ADR-017: Extract counter from ticket (returns None for legacy 4-field tickets).
+    pub fn extract_counter(ticket: &str) -> Result<Option<u64>, AetherError> {
+        let (_, _, _, counter, _) = Self::split_ticket_payload(ticket)?;
+        Ok(counter)
+    }
+
+    /// Generate a signed ticket for outbound requests (legacy format, no counter).
+    /// ADR-017: Use `generate_ticket_with_counter` for new implementations.
     pub fn generate_ticket(
         model_id: &str,
         version: &str,
@@ -114,6 +127,32 @@ impl SecurityManager {
             model_id,
             version,
             Self::now_secs(),
+            issuer_peer_id
+        );
+        let mut mac = HmacSha256::new_from_slice(&secret.0)
+            .map_err(|_| AetherError::InternalError("HMAC init failed".into()))?;
+        mac.update(payload.as_bytes());
+        let sig = BASE64.encode(mac.finalize().into_bytes());
+        Ok(format!("{}.{}", payload, sig))
+    }
+
+    /// ADR-017: Generate a signed ticket with monotonic counter for NTP manipulation resistance.
+    ///
+    /// Ticket format: `<model_id>|<version>|<unix_timestamp>|<counter>|<issuer_peer_id>.<base64-HMAC>`
+    /// The counter must be strictly increasing per issuer to prevent replay attacks with valid tickets.
+    pub fn generate_ticket_with_counter(
+        model_id: &str,
+        version: &str,
+        issuer_peer_id: &str,
+        counter: u64,
+        secret: &SecureKey,
+    ) -> Result<String, AetherError> {
+        let payload = format!(
+            "{}|{}|{}|{}|{}",
+            model_id,
+            version,
+            Self::now_secs(),
+            counter,
             issuer_peer_id
         );
         let mut mac = HmacSha256::new_from_slice(&secret.0)

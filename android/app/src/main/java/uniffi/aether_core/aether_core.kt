@@ -398,6 +398,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_canonicalize_json(`ptr`: Pointer,`json`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_aether_core_fn_method_aetherengine_check_patch_ram_feasibility(`ptr`: Pointer,`oldFileSize`: Long,`patchFileSize`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_decompress_file(`ptr`: Pointer,`compressedFd`: Int,`outputFd`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     fun uniffi_aether_core_fn_method_aetherengine_download_model(`ptr`: Pointer,`peerIp`: RustBuffer.ByValue,`peerPort`: Short,`seederPeerId`: RustBuffer.ByValue,`ticket`: RustBuffer.ByValue,`expectedSha256`: RustBuffer.ByValue,`resumeFrom`: Long,`fd`: Int,uniffi_out_err: UniffiRustCallStatus, 
@@ -418,6 +420,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_revoke_peer(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_aether_core_fn_method_aetherengine_seed_manifest_sequence(`ptr`: Pointer,`modelId`: RustBuffer.ByValue,`sequence`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_set_self_identity_public_key(`ptr`: Pointer,`publicKeyX962`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_set_self_peer_id(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -430,6 +434,8 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_verify_manifest(`ptr`: Pointer,`canonicalJson`: RustBuffer.ByValue,`sigHex`: RustBuffer.ByValue,`publicKeyDer`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    fun uniffi_aether_core_fn_method_aetherengine_verify_manifest_with_sequence(`ptr`: Pointer,`modelId`: RustBuffer.ByValue,`sequence`: Long,`canonicalJson`: RustBuffer.ByValue,`sigHex`: RustBuffer.ByValue,`publicKeyDer`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun ffi_aether_core_rustbuffer_alloc(`size`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     fun ffi_aether_core_rustbuffer_from_bytes(`bytes`: ForeignBytes.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -546,6 +552,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_canonicalize_json(
     ): Short
+    fun uniffi_aether_core_checksum_method_aetherengine_check_patch_ram_feasibility(
+    ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_decompress_file(
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_download_model(
@@ -566,6 +574,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_revoke_peer(
     ): Short
+    fun uniffi_aether_core_checksum_method_aetherengine_seed_manifest_sequence(
+    ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_set_self_identity_public_key(
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_set_self_peer_id(
@@ -577,6 +587,8 @@ internal interface UniffiLib : Library {
     fun uniffi_aether_core_checksum_method_aetherengine_validate_peer_protocol(
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_verify_manifest(
+    ): Short
+    fun uniffi_aether_core_checksum_method_aetherengine_verify_manifest_with_sequence(
     ): Short
     fun uniffi_aether_core_checksum_constructor_aetherengine_new(
     ): Short
@@ -601,6 +613,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_canonicalize_json() != 61360.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_aether_core_checksum_method_aetherengine_check_patch_ram_feasibility() != 8094.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_decompress_file() != 54578.toShort()) {
@@ -633,6 +648,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_aether_core_checksum_method_aetherengine_revoke_peer() != 12497.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_aether_core_checksum_method_aetherengine_seed_manifest_sequence() != 7250.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_set_self_identity_public_key() != 7255.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -649,6 +667,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_verify_manifest() != 53059.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_aether_core_checksum_method_aetherengine_verify_manifest_with_sequence() != 30926.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_aether_core_checksum_constructor_aetherengine_new() != 5416.toShort()) {
@@ -1079,6 +1100,8 @@ public interface AetherEngineInterface {
     
     fun `canonicalizeJson`(`json`: String): String
     
+    fun `checkPatchRamFeasibility`(`oldFileSize`: ULong, `patchFileSize`: ULong)
+    
     fun `decompressFile`(`compressedFd`: Int, `outputFd`: Int): ULong
     
     fun `downloadModel`(`peerIp`: String, `peerPort`: UShort, `seederPeerId`: String, `ticket`: String, `expectedSha256`: String, `resumeFrom`: ULong, `fd`: Int)
@@ -1099,6 +1122,8 @@ public interface AetherEngineInterface {
     
     fun `revokePeer`(`peerId`: String)
     
+    fun `seedManifestSequence`(`modelId`: String, `sequence`: ULong)
+    
     fun `setSelfIdentityPublicKey`(`publicKeyX962`: ByteArray)
     
     fun `setSelfPeerId`(`peerId`: String)
@@ -1110,6 +1135,8 @@ public interface AetherEngineInterface {
     fun `validatePeerProtocol`(`peerVersion`: String)
     
     fun `verifyManifest`(`canonicalJson`: String, `sigHex`: String, `publicKeyDer`: ByteArray): Boolean
+    
+    fun `verifyManifestWithSequence`(`modelId`: String, `sequence`: ULong, `canonicalJson`: String, `sigHex`: String, `publicKeyDer`: ByteArray)
     
     companion object
 }
@@ -1175,6 +1202,17 @@ open class AetherEngine : FFIObject, AetherEngineInterface {
         }.let {
             FfiConverterString.lift(it)
         }
+    
+    
+    @Throws(AetherException::class)override fun `checkPatchRamFeasibility`(`oldFileSize`: ULong, `patchFileSize`: ULong) =
+        callWithPointer {
+    uniffiRustCallWithError(AetherException) { _status ->
+    UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_check_patch_ram_feasibility(it,
+        FfiConverterULong.lower(`oldFileSize`),FfiConverterULong.lower(`patchFileSize`),
+        _status)
+}
+        }
+    
     
     
     @Throws(AetherException::class)override fun `decompressFile`(`compressedFd`: Int, `outputFd`: Int): ULong =
@@ -1289,6 +1327,17 @@ open class AetherEngine : FFIObject, AetherEngineInterface {
     
     
     
+    @Throws(AetherException::class)override fun `seedManifestSequence`(`modelId`: String, `sequence`: ULong) =
+        callWithPointer {
+    uniffiRustCallWithError(AetherException) { _status ->
+    UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_seed_manifest_sequence(it,
+        FfiConverterString.lower(`modelId`),FfiConverterULong.lower(`sequence`),
+        _status)
+}
+        }
+    
+    
+    
     @Throws(AetherException::class)override fun `setSelfIdentityPublicKey`(`publicKeyX962`: ByteArray) =
         callWithPointer {
     uniffiRustCallWithError(AetherException) { _status ->
@@ -1353,6 +1402,17 @@ open class AetherEngine : FFIObject, AetherEngineInterface {
         }.let {
             FfiConverterBoolean.lift(it)
         }
+    
+    
+    @Throws(AetherException::class)override fun `verifyManifestWithSequence`(`modelId`: String, `sequence`: ULong, `canonicalJson`: String, `sigHex`: String, `publicKeyDer`: ByteArray) =
+        callWithPointer {
+    uniffiRustCallWithError(AetherException) { _status ->
+    UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_verify_manifest_with_sequence(it,
+        FfiConverterString.lower(`modelId`),FfiConverterULong.lower(`sequence`),FfiConverterString.lower(`canonicalJson`),FfiConverterString.lower(`sigHex`),FfiConverterByteArray.lower(`publicKeyDer`),
+        _status)
+}
+        }
+    
     
     
 

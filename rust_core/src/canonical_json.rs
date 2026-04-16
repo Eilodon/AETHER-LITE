@@ -60,6 +60,6 @@ mod tests {
     #[test]
     fn invalid_json_is_rejected() {
         let err = canonicalize_json("{not-json").unwrap_err();
-        assert!(err.to_string().contains("Invalid JSON"));
+        assert!(matches!(err, AetherError::InternalError(_)));
     }
 }

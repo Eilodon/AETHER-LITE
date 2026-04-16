@@ -48,6 +48,17 @@ impl Config {
     /// Zstd has extreme compression ratios; this limits memory/disk exhaustion.
     pub const MAX_DECOMPRESSED_SIZE: u64 = 2 * 1024 * 1024 * 1024; // 2 GB
 
+    /// ADR-013: Maximum length of a single HTTP header value (bytes).
+    /// Prevents abnormally long values from consuming memory or enabling attacks.
+    /// While MAX_RESPONSE_HEADER_BYTES caps total header size (16 KB),
+    /// this limits individual values to 1 KB.
+    pub const MAX_HEADER_VALUE_BYTES: usize = 1024;
+
+    /// ADR-015: Maximum consecutive ticket verification failures per peer
+    /// before the peer is temporarily blocked from further attempts.
+    /// Prevents HMAC computation abuse via repeated invalid tickets.
+    pub const MAX_TICKET_VERIFY_FAILURES: u32 = 5;
+
     /// Obfuscated auth header name.
     #[inline(always)]
     pub fn get_header_key() -> &'static str {

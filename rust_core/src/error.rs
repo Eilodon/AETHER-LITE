@@ -3,10 +3,14 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum AetherError {
-    #[error("Server failed to start: {0}")]
+    #[error("Server failed to start")]
     ServerStartupError(String),
 
-    #[error("Network I/O error: {0}")]
+    // ADR-014: Display message is generic; detailed string is for internal logging only.
+    // Use tracing::error!() at the call site to log the full detail, then return
+    // this variant with a brief label so the peer never sees OS error strings,
+    // file paths, or other implementation details.
+    #[error("Network error")]
     NetworkError(String),
 
     #[error("Security violation: {0}")]
@@ -21,15 +25,16 @@ pub enum AetherError {
     #[error("Peer not found in table")]
     PeerNotFound,
 
-    #[error("Surgical patch failed: {0}")]
+    #[error("Patch failed")]
     PatchError(String),
 
     /// SHA-256 digest of received data did not match expected value.
-    #[error("Checksum mismatch — expected {expected}, got {actual}")]
+    // ADR-014: Do not expose actual hash values in Display — log them instead.
+    #[error("Checksum mismatch")]
     ChecksumMismatch { expected: String, actual: String },
 
     /// zstd decompression failure.
-    #[error("Decompression failed: {0}")]
+    #[error("Decompression failed")]
     DecompressError(String),
 
     /// ECDSA manifest signature is invalid.
@@ -37,14 +42,15 @@ pub enum AetherError {
     SignatureVerificationFailed,
 
     /// Server sent fewer bytes than declared in Content-Length.
-    #[error("Download incomplete: received {received} of {expected} bytes")]
+    #[error("Download incomplete")]
     DownloadIncomplete { received: u64, expected: u64 },
 
     /// Peer exceeded concurrent-connection limit.
     #[error("Rate limit exceeded — too many concurrent connections")]
     RateLimitExceeded,
 
-    #[error("Internal system error: {0}")]
+    // ADR-014: Display message is generic; detailed string is for internal logging only.
+    #[error("Internal error")]
     InternalError(String),
 }
 

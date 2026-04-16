@@ -18,6 +18,7 @@ pub mod error;
 mod network;
 pub mod patcher;
 pub mod security;
+pub mod transport_encryption;  // ADR-018: Noise Protocol stub (roadmap)
 
 use crate::canonical_json::canonicalize_json;
 use crate::config::Config;
@@ -57,8 +58,10 @@ uniffi::include_scaffolding!("aether");
 // ── Shared server state ───────────────────────────────────────────────────────
 
 struct AppState {
-    peer_keys: DashMap<String, PeerKeys>,
-    peer_permissions: DashMap<String, HashSet<String>>,
+    // ADR-012: Unified peer map — single DashMap entry per peer for atomic revocation.
+    // Replaces the previous separate peer_keys + peer_permissions + peer_limiters maps,
+    // which required 3 non-atomic remove() calls in revoke_peer().
+    peers: DashMap<String, PeerEntry>,
     seen_tickets: DashMap<String, u64>,
     /// ADR-007: CancellationToken replaces Arc&lt;Notify&gt; for graceful shutdown.
     /// Per-session token created by start_server(), cancelled by stop_server().
@@ -66,11 +69,27 @@ struct AppState {
     shutdown_token: RwLock<CancellationToken>,
     /// Limits concurrent download sessions to prevent resource exhaustion.
     download_limiter: Arc<Semaphore>,
-    /// Per-peer download limiters to prevent a single peer from exhausting slots.
-    peer_limiters: DashMap<String, PeerLimiterEntry>,
     /// Files registered for serving by model_id → absolute path on disk.
     /// Populated by `register_file_for_serving` before a peer connects.
     serve_files: DashMap<String, PathBuf>,
+    /// ADR-015: Per-peer consecutive ticket verification failure counter.
+    /// After MAX_TICKET_VERIFY_FAILURES consecutive failures, the peer is
+    /// temporarily blocked from attempting further verifications.
+    ticket_verify_failures: DashMap<String, u32>,
+    /// ADR-016: Last accepted manifest sequence per model_id.
+    /// Rejects manifests with sequence <= stored value (rollback protection).
+    manifest_sequences: DashMap<String, u64>,
+    /// ADR-017: Last accepted ticket counter per issuer peer_id.
+    /// Rejects tickets with counter <= stored value (NTP manipulation resistance).
+    ticket_counters: DashMap<String, u64>,
+}
+
+/// ADR-012: All per-peer state in a single struct stored under one DashMap key.
+/// Removing this entry is atomic — no window between key/permission/limiter removal.
+struct PeerEntry {
+    keys: PeerKeys,
+    permissions: HashSet<String>,
+    limiter: PeerLimiterEntry,
 }
 
 #[derive(Clone)]
@@ -152,13 +171,14 @@ impl AetherEngine {
 
         Self {
             state: Arc::new(AppState {
-                peer_keys: DashMap::new(),
-                peer_permissions: DashMap::new(),
+                peers: DashMap::new(),
                 seen_tickets: DashMap::new(),
                 shutdown_token: RwLock::new(CancellationToken::new()),
                 download_limiter: Arc::new(Semaphore::new(Config::MAX_CONCURRENT_DOWNLOADS)),
-                peer_limiters: DashMap::new(),
                 serve_files: DashMap::new(),
+                ticket_verify_failures: DashMap::new(),
+                manifest_sequences: DashMap::new(),
+                ticket_counters: DashMap::new(),
             }),
             rt: Arc::new(Runtime::new().expect("Tokio runtime init failed")),
             self_peer_id: Arc::new(RwLock::new(default_id)),
@@ -259,8 +279,8 @@ impl AetherEngine {
                         eviction_state.seen_tickets
                             .retain(|_, seen_at| now.saturating_sub(*seen_at) <= ttl);
                         eviction_state
-                            .peer_limiters
-                            .retain(|_, entry| !entry.is_idle_expired(now));
+                            .peers
+                            .retain(|_, entry| !entry.limiter.is_idle_expired(now));
                     }
                 }
             }
@@ -331,13 +351,27 @@ impl AetherEngine {
         }
         let auth_key = SecurityManager::derive_hmac_key(&shared_secret)?;
         let transport_key = SecurityManager::derive_transport_key(&shared_secret)?;
-        self.state.peer_keys.insert(
-            peer_id,
-            PeerKeys {
-                auth_key: SecureKey(auth_key.to_vec()),
-                transport_key: SecureKey(transport_key.to_vec()),
-            },
-        );
+        let now = current_unix_secs();
+        // ADR-012: Insert into unified peer map. If peer already exists,
+        // update keys but preserve permissions and limiter.
+        match self.state.peers.entry(peer_id.clone()) {
+            dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                e.get_mut().keys = PeerKeys {
+                    auth_key: SecureKey(auth_key.to_vec()),
+                    transport_key: SecureKey(transport_key.to_vec()),
+                };
+            }
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                e.insert(PeerEntry {
+                    keys: PeerKeys {
+                        auth_key: SecureKey(auth_key.to_vec()),
+                        transport_key: SecureKey(transport_key.to_vec()),
+                    },
+                    permissions: HashSet::new(),
+                    limiter: PeerLimiterEntry::new(now),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -347,14 +381,11 @@ impl AetherEngine {
         peer_id: String,
         model_id: String,
     ) -> Result<(), AetherError> {
-        if !self.state.peer_keys.contains_key(&peer_id) {
-            return Err(AetherError::PeerNotFound);
-        }
-        self.state
-            .peer_permissions
-            .entry(peer_id)
-            .or_default()
-            .insert(model_id);
+        let mut entry = match self.state.peers.get_mut(&peer_id) {
+            Some(e) => e,
+            None => return Err(AetherError::PeerNotFound),
+        };
+        entry.permissions.insert(model_id);
         Ok(())
     }
 
@@ -363,17 +394,83 @@ impl AetherEngine {
     /// this in addition to clearing persistent storage, so that a revoked peer
     /// cannot continue downloading in the current session.
     ///
-    /// Note: DashMap operations are individually atomic but the sequence is not.
-    /// The window between key and permission removal is small (~ns) and the
-    /// worst case is an auth failure for an in-progress request.
+    /// ADR-012: Single atomic DashMap::remove() — no window between key and
+    /// permission removal. All peer state lives under one key.
     pub fn revoke_peer(&self, peer_id: String) -> Result<(), AetherError> {
-        let had_keys = self.state.peer_keys.remove(&peer_id).is_some();
-        let had_perms = self.state.peer_permissions.remove(&peer_id).is_some();
-        let _ = self.state.peer_limiters.remove(&peer_id);
-        if !had_keys && !had_perms {
+        if self.state.peers.remove(&peer_id).is_none() {
             return Err(AetherError::PeerNotFound);
         }
         info!("Revoked peer: {peer_id}");
+        Ok(())
+    }
+
+    /// ADR-016: Verify manifest signature AND enforce monotonic sequence number.
+    ///
+    /// Rejects manifests with sequence <= last accepted sequence for the same model_id.
+    /// This prevents rollback attacks where an old valid signed manifest is replayed
+    /// to force a version downgrade.
+    ///
+    /// # Arguments
+    /// * `model_id` – The model identifier from the manifest payload.
+    /// * `sequence` – The monotonic sequence number from the manifest payload.
+    /// * `canonical_json` – The canonical JSON string of the manifest payload.
+    /// * `signature_hex` – The hex-encoded ECDSA signature.
+    /// * `public_key_der` – The DER-encoded public key for verification.
+    pub fn verify_manifest_with_sequence(
+        &self,
+        model_id: String,
+        sequence: u64,
+        canonical_json: String,
+        signature_hex: String,
+        public_key_der: Vec<u8>,
+    ) -> Result<(), AetherError> {
+        // First: verify ECDSA signature
+        SecurityManager::verify_manifest(&canonical_json, &signature_hex, &public_key_der)?;
+
+        // Second: check monotonic sequence
+        let last_accepted = self
+            .state
+            .manifest_sequences
+            .get(&model_id)
+            .map(|v| *v)
+            .unwrap_or(0);
+        if sequence <= last_accepted {
+            return Err(AetherError::SecurityError(
+                format!("Manifest sequence {} is not greater than last accepted {} (ADR-016)", sequence, last_accepted)
+            ));
+        }
+
+        // Update stored sequence atomically
+        self.state.manifest_sequences.insert(model_id, sequence);
+        Ok(())
+    }
+
+    /// Seed ADR-016 manifest sequence state from platform-persisted storage.
+    ///
+    /// Mobile clients persist the last accepted sequence across app restarts,
+    /// while the Rust engine only keeps in-memory state for the current
+    /// process. This method hydrates that persisted value into the engine
+    /// without allowing a lower value to overwrite a newer in-memory one.
+    pub fn seed_manifest_sequence(
+        &self,
+        model_id: String,
+        sequence: u64,
+    ) -> Result<(), AetherError> {
+        if sequence == 0 {
+            return Err(AetherError::SecurityError(
+                "Manifest sequence must be > 0 (ADR-016)".into(),
+            ));
+        }
+
+        let current = self
+            .state
+            .manifest_sequences
+            .get(&model_id)
+            .map(|v| *v)
+            .unwrap_or(0);
+        if sequence > current {
+            self.state.manifest_sequences.insert(model_id, sequence);
+        }
         Ok(())
     }
 
@@ -403,6 +500,45 @@ impl AetherEngine {
         Ok(())
     }
 
+    /// ADR-017: Verify ticket with monotonic counter check for NTP manipulation resistance.
+    ///
+    /// Rejects tickets with counter <= last accepted counter for the same issuer.
+    /// Falls back to standard verification for legacy 4-field tickets (counter = None).
+    ///
+    /// # Arguments
+    /// * `ticket` – The ticket string to verify.
+    /// * `secret` – The HMAC secret key.
+    /// * `issuer_peer_id` – The expected issuer peer ID (extracted from ticket and verified).
+    pub fn verify_ticket_with_counter(
+        &self,
+        ticket: &str,
+        secret: &SecureKey,
+        issuer_peer_id: &str,
+    ) -> Result<(), AetherError> {
+        // First: standard HMAC and timestamp verification
+        SecurityManager::verify_ticket(ticket, secret)?;
+
+        // Second: check monotonic counter if present (ADR-017)
+        let counter = SecurityManager::extract_counter(ticket)?;
+        if let Some(cnt) = counter {
+            let last_accepted = self
+                .state
+                .ticket_counters
+                .get(issuer_peer_id)
+                .map(|v| *v)
+                .unwrap_or(0);
+            if cnt <= last_accepted {
+                return Err(AetherError::SecurityError(
+                    format!("Ticket counter {} is not greater than last accepted {} (ADR-017)", cnt, last_accepted)
+                ));
+            }
+            // Update stored counter atomically
+            self.state.ticket_counters.insert(issuer_peer_id.to_string(), cnt);
+        }
+        // If counter is None (legacy ticket), allow it (backward compatibility)
+        Ok(())
+    }
+
     // ── Zero-copy download ────────────────────────────────────────────────────
 
     pub fn download_model(
@@ -424,13 +560,13 @@ impl AetherEngine {
         // ── Verify HMAC BEFORE reading any field from the ticket payload ──
         // The caller provides `seeder_peer_id` (known from the handshake)
         // so we look up the auth key without trusting the ticket contents.
-        let peer_keys = self
+        let peer_entry = self
             .state
-            .peer_keys
+            .peers
             .get(&seeder_peer_id)
             .ok_or(AetherError::PeerNotFound)?;
 
-        SecurityManager::verify_ticket(&ticket, &peer_keys.auth_key)?;
+        SecurityManager::verify_ticket(&ticket, &peer_entry.keys.auth_key)?;
 
         // Only AFTER HMAC verification is it safe to parse the ticket.
         // Validate that the issuer in the ticket matches the expected seeder.
@@ -440,9 +576,10 @@ impl AetherEngine {
                 "Ticket issuer does not match expected seeder peer ID".into(),
             ));
         }
+        self.verify_ticket_with_counter(&ticket, &peer_entry.keys.auth_key, &issuer_peer_id)?;
 
-        let transport_key = peer_keys.transport_key.clone();
-        drop(peer_keys); // release DashMap reference
+        let transport_key = peer_entry.keys.transport_key.clone();
+        drop(peer_entry); // release DashMap reference
 
         let self_id = self.get_self_peer_id();
         self.rt.block_on(download_file_to_fd(
@@ -603,13 +740,21 @@ async fn download_handler(
     // SECURITY: Prevent a single peer from exhausting all global download slots
     let now = current_unix_secs();
     let peer_limiter = {
+        // ADR-012: limiter is inside the unified PeerEntry
         let entry = state
             .app
-            .peer_limiters
+            .peers
             .entry(peer_id.clone())
-            .or_insert_with(|| PeerLimiterEntry::new(now));
-        entry.touch(now);
-        entry.semaphore.clone()
+            .or_insert_with(|| PeerEntry {
+                keys: PeerKeys {
+                    auth_key: SecureKey(vec![]),
+                    transport_key: SecureKey(vec![]),
+                },
+                permissions: HashSet::new(),
+                limiter: PeerLimiterEntry::new(now),
+            });
+        entry.limiter.touch(now);
+        entry.limiter.semaphore.clone()
     };
     let _peer_permit = match peer_limiter.try_acquire() {
         Ok(p) => p,
@@ -650,14 +795,56 @@ async fn download_handler(
         }
     }
 
-    let key_ref = match state.app.peer_keys.get(&peer_id) {
+    let peer_ref = match state.app.peers.get(&peer_id) {
         Some(k) => k,
         None => return (StatusCode::FORBIDDEN, "Unknown peer identity").into_response(),
     };
 
-    if SecurityManager::verify_ticket(&ticket_str, &key_ref.value().auth_key).is_err() {
+    // ADR-015: Block peers with too many consecutive ticket verification failures.
+    if let Some(failures) = state.app.ticket_verify_failures.get(&peer_id) {
+        if *failures >= Config::MAX_TICKET_VERIFY_FAILURES {
+            tracing::warn!(
+                "Peer {} blocked: {} consecutive ticket verify failures",
+                peer_id,
+                *failures
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many authentication failures",
+            )
+                .into_response();
+        }
+    }
+
+    if SecurityManager::verify_ticket(&ticket_str, &peer_ref.value().keys.auth_key).is_err() {
+        // ADR-015: Increment consecutive failure counter
+        state
+            .app
+            .ticket_verify_failures
+            .entry(peer_id.clone())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
         return (StatusCode::FORBIDDEN, "Invalid ticket").into_response();
     }
+
+    let issuer_peer_id = match SecurityManager::extract_issuer_peer_id(&ticket_str) {
+        Ok(issuer) => issuer.to_string(),
+        Err(_) => return (StatusCode::BAD_REQUEST, "Malformed ticket payload").into_response(),
+    };
+    if let Err(_) =
+        verify_ticket_with_counter_on_state(&state.app, &ticket_str, &peer_ref.value().keys.auth_key, &issuer_peer_id)
+    {
+        state
+            .app
+            .ticket_verify_failures
+            .entry(peer_id.clone())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        return (StatusCode::FORBIDDEN, "Invalid ticket").into_response();
+    }
+
+    // ADR-015: Reset failure counter on successful verification
+    state.app.ticket_verify_failures.remove(&peer_id);
 
     if let Err(e) = reject_replayed_ticket(&state.app.seen_tickets, &ticket_str) {
         tracing::warn!("Replay rejected for peer {}: {}", peer_id, e);
@@ -670,10 +857,8 @@ async fn download_handler(
         Err(_) => return (StatusCode::BAD_REQUEST, "Malformed ticket payload").into_response(),
     };
 
-    let allowed = match state.app.peer_permissions.get(&peer_id) {
-        Some(models) => models.contains(&model_id),
-        None => false,
-    };
+    // ADR-012: permissions are inside the unified PeerEntry
+    let allowed = peer_ref.value().permissions.contains(&model_id);
     if !allowed {
         return (
             StatusCode::FORBIDDEN,
@@ -700,7 +885,7 @@ async fn download_handler(
         Ok(f) => f,
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Cannot open file").into_response(),
     };
-    let transport_key = key_ref.value().transport_key.clone();
+    let transport_key = peer_ref.value().keys.transport_key.clone();
 
     // ── Random nonce for this session (prevents keystream reuse across restarts)
     let nonce = SecurityManager::generate_random_nonce();
@@ -799,6 +984,32 @@ fn current_unix_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs()
+}
+
+fn verify_ticket_with_counter_on_state(
+    state: &AppState,
+    ticket: &str,
+    secret: &SecureKey,
+    issuer_peer_id: &str,
+) -> Result<(), AetherError> {
+    SecurityManager::verify_ticket(ticket, secret)?;
+    if let Some(counter) = SecurityManager::extract_counter(ticket)? {
+        let last_accepted = state
+            .ticket_counters
+            .get(issuer_peer_id)
+            .map(|v| *v)
+            .unwrap_or(0);
+        if counter <= last_accepted {
+            return Err(AetherError::SecurityError(format!(
+                "Ticket counter {} is not greater than last accepted {} (ADR-017)",
+                counter, last_accepted
+            )));
+        }
+        state
+            .ticket_counters
+            .insert(issuer_peer_id.to_string(), counter);
+    }
+    Ok(())
 }
 
 fn encrypted_file_stream(
@@ -966,6 +1177,22 @@ mod tests {
     }
 
     #[test]
+    fn seed_manifest_sequence_rejects_zero() {
+        let engine = AetherEngine::new();
+        let result = engine.seed_manifest_sequence("model-a".into(), 0);
+        assert!(matches!(result, Err(AetherError::SecurityError(_))));
+    }
+
+    #[test]
+    fn seed_manifest_sequence_keeps_highest_value() {
+        let engine = AetherEngine::new();
+        engine.seed_manifest_sequence("model-a".into(), 5).unwrap();
+        engine.seed_manifest_sequence("model-a".into(), 3).unwrap();
+        let stored = engine.state.manifest_sequences.get("model-a").map(|v| *v);
+        assert_eq!(stored, Some(5));
+    }
+
+    #[test]
     fn heartbeat_fails_before_server_starts() {
         let engine = AetherEngine::new();
         // bound_port is None → heartbeat returns InternalError
@@ -1101,14 +1328,12 @@ mod tests {
             .unwrap();
 
         // Peer exists before revocation
-        assert!(engine.state.peer_keys.contains_key("peer-a"));
-        assert!(engine.state.peer_permissions.contains_key("peer-a"));
+        assert!(engine.state.peers.contains_key("peer-a"));
 
         engine.revoke_peer("peer-a".into()).unwrap();
 
-        // Peer gone after revocation
-        assert!(!engine.state.peer_keys.contains_key("peer-a"));
-        assert!(!engine.state.peer_permissions.contains_key("peer-a"));
+        // Peer gone after revocation (ADR-012: single atomic remove)
+        assert!(!engine.state.peers.contains_key("peer-a"));
     }
 
     /// ADR-011: revoke_peer returns PeerNotFound for unknown peer.

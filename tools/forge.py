@@ -190,6 +190,8 @@ def keygen(out: str, passphrase: str | None):
 @click.option("--old",  "old_file",  default=None,  type=click.Path(exists=True))
 @click.option("--id",   "model_id",  required=True)
 @click.option("--ver",  "version",   required=True)
+@click.option("--seq",  "sequence",  default=None, type=int,
+              help="Monotonic sequence number (ADR-016). Required for production manifests.")
 @click.option("--key",  "key_path",  default=None, type=click.Path(exists=True),
               help="Path to admin_private.pem. Required unless --dry-run is set.")
 @click.option("--passphrase", default=None, help="Passphrase for encrypted admin_private.pem.")
@@ -198,7 +200,7 @@ def keygen(out: str, passphrase: str | None):
 @click.option("--compress-level", default=19, show_default=True, type=click.IntRange(1, 22))
 @click.option("--dry-run", is_flag=True, default=False,
               help="Simulate without writing any output files. --key is not required.")
-def publish(new_file, old_file, model_id, version, key_path, passphrase,
+def publish(new_file, old_file, model_id, version, sequence, key_path, passphrase,
             cdn_base, out_dir, compress_level, dry_run):
     """Compress, patch (if --old given), sign, and export a deployment package.
 
@@ -250,9 +252,13 @@ def publish(new_file, old_file, model_id, version, key_path, passphrase,
         }
 
     # ── 3. Build + sign manifest ──────────────────────────────────────────────
+    # ADR-016: sequence is mandatory for real publishes, optional for dry-run.
+    if not dry_run and sequence is None:
+        raise click.UsageError("--seq is required when not using --dry-run (ADR-016: monotonic sequence)")
     payload = {
         "id":        model_id,
         "version":   version,
+        "sequence":  sequence,  # ADR-016: monotonic counter, None only in dry-run
         "timestamp": int(time.time()),
         "full": {
             "url":      f"{cdn_base}/{full_filename}",
@@ -319,6 +325,11 @@ def verify(mpath: str, kpath: str):
     if verify_manifest_sig(payload, sig_hex, pub_key):
         click.echo("✅  Signature VALID")
         click.echo(f"    Model   : {payload.get('id')}  v{payload.get('version')}")
+        seq = payload.get("sequence")
+        if seq is not None:
+            click.echo(f"    Sequence: {seq}")
+        else:
+            click.echo("    Sequence: ⚠️  MISSING (ADR-016: manifests must have monotonic sequence)")
         click.echo(f"    Issued  : {time.ctime(payload.get('timestamp', 0))}")
     else:
         click.echo("❌  Signature INVALID — manifest may have been tampered with!", err=True)

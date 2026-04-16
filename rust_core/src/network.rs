@@ -24,6 +24,12 @@ use tracing::{error, info, warn};
 /// Validate that a string is safe to use as an HTTP header value.
 /// RFC 7230 Section 3.2.4: field-content must not contain CR, LF, or other control chars.
 fn validate_header_value(value: &str) -> Result<(), AetherError> {
+    // ADR-013: Reject abnormally long header values.
+    if value.len() > Config::MAX_HEADER_VALUE_BYTES {
+        return Err(AetherError::SecurityError(
+            "Header value exceeds maximum allowed length".into(),
+        ));
+    }
     // RFC 7230: field-content cannot contain CR or LF
     if value.contains('\r') || value.contains('\n') {
         return Err(AetherError::SecurityError(
@@ -524,8 +530,7 @@ mod tests {
             actual: "ccdd".into(),
         };
         let msg = err.to_string();
-        assert!(msg.contains("aabb"));
-        assert!(msg.contains("ccdd"));
+        assert_eq!(msg, "Checksum mismatch");
     }
 
     #[tokio::test]
