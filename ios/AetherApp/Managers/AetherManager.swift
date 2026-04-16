@@ -332,7 +332,16 @@ final class AetherManager: ObservableObject {
         }
         print("✅ Manifest signature verified")
 
-        // ── 2. Open raw fds (no FileHandle wrappers) ──────────────────────────
+        // ── 2. ADR-003: Check available RAM before patching ───────────────────
+        let oldSize = (try? FileManager.default.attributesOfItem(atPath: oldUrl.path)[.size] as? UInt64) ?? 0
+        let patchSize = (try? FileManager.default.attributesOfItem(atPath: patchUrl.path)[.size] as? UInt64) ?? 0
+        do {
+            try engine.checkPatchRamFeasibility(oldFileSize: oldSize, patchFileSize: patchSize)
+        } catch {
+            throw AetherError.PatchError("ADR-003: Insufficient RAM for patching (old=\(oldSize)B, patch=\(patchSize)B)")
+        }
+
+        // ── 3. Open raw fds (no FileHandle wrappers) ──────────────────────────
         if !FileManager.default.fileExists(atPath: newUrl.path) {
             FileManager.default.createFile(atPath: newUrl.path, contents: nil)
         }
@@ -349,7 +358,7 @@ final class AetherManager: ObservableObject {
             throw AetherError.PatchError("Failed to open file descriptors")
         }
 
-        // ── 3. Apply patch (Rust closes all three fds on return) ──────────────
+        // ── 4. Apply patch (Rust closes all three fds on return) ──────────────
         print("🔪 Surgical patch starting…")
         try await Task.detached(priority: .utility) {
             try engine.applyPatch(

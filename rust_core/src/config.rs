@@ -37,8 +37,8 @@ impl Config {
     /// Background cleanup cadence for in-memory eviction tasks.
     pub const BACKGROUND_CLEANUP_INTERVAL_SECS: u64 = 30;
 
-    /// Current bspatch pipeline buffers the old file and patch delta in RAM.
-    /// Keep the combined input under this ceiling to avoid OOM on low-RAM devices.
+    /// Ceiling for combined old+patch virtual address space (ADR-006: mmap replaces
+    /// read_to_end, so this is a virtual address guard rather than a physical RAM limit).
     pub const MAX_PATCH_BUFFERED_INPUT_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
 
     /// Individual patch delta ceiling. Typical mobile updates are well below this.

@@ -9,7 +9,7 @@ use crate::error::AetherError;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::os::fd::FromRawFd;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Decompress a zstd-compressed file descriptor into an output file descriptor.
 ///
@@ -31,6 +31,26 @@ pub fn decompress_zstd_fds(compressed_fd: i32, output_fd: i32) -> Result<u64, Ae
     let mut decoder = zstd::Decoder::new(compressed_file)
         .map_err(|e| AetherError::DecompressError(format!("Decoder init failed: {}", e)))?;
 
+    // ADR-004: Dynamic decompression limit based on available disk space.
+    // The fixed 2GB ceiling can exhaust disk on low-storage mobile devices.
+    // We now cap at 80% of available disk space, never exceeding the
+    // absolute MAX_DECOMPRESSED_SIZE bomb-protection ceiling.
+    let dynamic_limit = match available_disk_space(&output_file) {
+        Ok(free) => {
+            let safe = (free as f64 * 0.8) as u64;
+            let limit = std::cmp::min(Config::MAX_DECOMPRESSED_SIZE, safe);
+            info!(
+                "ADR-004: disk free={} bytes, dynamic limit={} bytes (cap={})",
+                free, limit, Config::MAX_DECOMPRESSED_SIZE
+            );
+            limit
+        }
+        Err(e) => {
+            warn!("ADR-004: cannot query disk space ({}), falling back to static limit", e);
+            Config::MAX_DECOMPRESSED_SIZE
+        }
+    };
+
     let mut writer = BufWriter::new(output_file);
     let mut buf = vec![0u8; 256 * 1024]; // 256 KB chunks
     let mut total_bytes = 0u64;
@@ -40,11 +60,11 @@ pub fn decompress_zstd_fds(compressed_fd: i32, output_fd: i32) -> Result<u64, Ae
             Ok(0) => break,
             Ok(n) => {
                 total_bytes += n as u64;
-                // SECURITY: Prevent decompression bomb attacks
-                if total_bytes > Config::MAX_DECOMPRESSED_SIZE {
+                // SECURITY: Prevent decompression bomb attacks (dynamic ceiling)
+                if total_bytes > dynamic_limit {
                     return Err(AetherError::DecompressError(format!(
-                        "Decompressed size exceeds maximum limit of {} bytes (bomb protection)",
-                        Config::MAX_DECOMPRESSED_SIZE
+                        "Decompressed size exceeds dynamic limit of {} bytes (bomb protection, disk-space-aware)",
+                        dynamic_limit
                     )));
                 }
                 writer
@@ -63,6 +83,21 @@ pub fn decompress_zstd_fds(compressed_fd: i32, output_fd: i32) -> Result<u64, Ae
 
     info!("Decompression complete: {} bytes written", total_bytes);
     Ok(total_bytes)
+}
+
+/// Query available disk space for the filesystem containing the given file.
+/// Uses POSIX `fstatfs` which works on Linux, Android, macOS, and iOS.
+fn available_disk_space(file: &File) -> std::io::Result<u64> {
+    use std::os::unix::io::AsRawFd;
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    let fd = file.as_raw_fd();
+    if unsafe { libc::fstatfs(fd, &mut stat) } == 0 {
+        // f_bavail = free blocks available to unprivileged process
+        let free = stat.f_bavail as u64 * stat.f_bsize as u64;
+        Ok(free)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

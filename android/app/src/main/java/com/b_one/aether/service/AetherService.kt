@@ -268,6 +268,17 @@ class AetherService : Service() {
                 require(oldFile.exists())   { "Old model not found" }
                 require(patchFile.exists()) { "Patch file not found" }
 
+                // ADR-003: Check available RAM before patching to prevent OOM.
+                val oldSize = oldFile.length()
+                val patchSize = patchFile.length()
+                try {
+                    rustEngine.checkPatchRamFeasibility(oldSize, patchSize)
+                } catch (e: Exception) {
+                    Log.e(TAG, "❌ ADR-003: Insufficient RAM for patching (old=${oldSize}B, patch=${patchSize}B)", e)
+                    onError?.invoke(e)
+                    return@launch
+                }
+
                 val oldPfd   = ParcelFileDescriptor.open(oldFile,   ParcelFileDescriptor.MODE_READ_ONLY)
                 val patchPfd = ParcelFileDescriptor.open(patchFile, ParcelFileDescriptor.MODE_READ_ONLY)
                 val newPfd   = ParcelFileDescriptor.open(newFile,

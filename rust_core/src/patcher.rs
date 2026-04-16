@@ -7,6 +7,7 @@
 
 use crate::config::Config;
 use crate::error::AetherError;
+use memmap2::Mmap;
 use qbsdiff::Bspatch;
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -50,13 +51,17 @@ pub fn apply_patch_fds(
     let new_file = unsafe { File::from_raw_fd(new_fd) };
     enforce_patch_memory_gate(&old_file, &patch_file)?;
 
-    // ── 1. Verify patch file integrity before applying ─────────────────────
-    let old_bytes = read_file_to_bytes(old_file)
-        .map_err(|e| AetherError::PatchError(format!("Failed to read old file: {}", e)))?;
-    let patch_bytes = read_file_to_bytes(patch_file)
-        .map_err(|e| AetherError::PatchError(format!("Failed to read patch: {}", e)))?;
+    // ── 1. Memory-map old and patch files (ADR-006) ──────────────────────
+    // ADR-006: Replace read_to_end with mmap. The OS manages paging,
+    // significantly reducing physical RAM pressure (RSS) on mobile devices.
+    let old_mmap = unsafe { Mmap::map(&old_file) }
+        .map_err(|e| AetherError::PatchError(format!("Failed to mmap old file: {}", e)))?;
+    let patch_mmap = unsafe { Mmap::map(&patch_file) }
+        .map_err(|e| AetherError::PatchError(format!("Failed to mmap patch file: {}", e)))?;
+
+    // Verify patch file integrity before applying
     if !expected_patch_sha256.is_empty() {
-        let actual_patch_sha = hex::encode(Sha256::digest(&patch_bytes));
+        let actual_patch_sha = hex::encode(Sha256::digest(&patch_mmap[..]));
         if actual_patch_sha != expected_patch_sha256 {
             error!(
                 "Patch SHA-256 mismatch: expected={} actual={}",
@@ -73,11 +78,11 @@ pub fn apply_patch_fds(
     // ── 2. Apply BSDIFF40 patch ────────────────────────────────────────────
     let mut new_writer = BufWriter::new(new_file);
 
-    let patcher = Bspatch::new(&patch_bytes).map_err(|e| {
+    let patcher = Bspatch::new(&patch_mmap[..]).map_err(|e| {
         error!("bspatch parse error: {:?}", e);
         AetherError::PatchError(format!("bspatch parse: {}", e))
     })?;
-    patcher.apply(&old_bytes, &mut new_writer).map_err(|e| {
+    patcher.apply(&old_mmap[..], &mut new_writer).map_err(|e| {
         error!("bspatch apply error: {:?}", e);
         AetherError::PatchError(format!("bspatch apply: {}", e))
     })?;
@@ -103,13 +108,6 @@ pub fn apply_patch_fds(
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Read the entire contents of a File into memory and return the raw bytes.
-fn read_file_to_bytes(mut f: File) -> std::io::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
 fn enforce_patch_memory_gate(old_file: &File, patch_file: &File) -> Result<(), AetherError> {
     let old_len = old_file
         .metadata()
@@ -131,7 +129,7 @@ fn enforce_patch_memory_gate(old_file: &File, patch_file: &File) -> Result<(), A
     let combined = old_len.saturating_add(patch_len);
     if combined > Config::MAX_PATCH_BUFFERED_INPUT_BYTES {
         return Err(AetherError::PatchError(format!(
-            "Current patch pipeline buffers old+patch in RAM ({} bytes), exceeding the {} byte ceiling",
+            "Patch inputs (old+patch) total {} bytes, exceeding the {} byte ceiling (virtual address space guard)",
             combined,
             Config::MAX_PATCH_BUFFERED_INPUT_BYTES
         )));

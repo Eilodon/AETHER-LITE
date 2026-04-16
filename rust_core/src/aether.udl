@@ -61,6 +61,9 @@ interface AetherEngine {
     );
 
     [Throws=AetherError]
+    void check_patch_ram_feasibility(u64 old_file_size, u64 patch_file_size);
+
+    [Throws=AetherError]
     void apply_patch(
         i32 old_fd,
         i32 patch_fd,

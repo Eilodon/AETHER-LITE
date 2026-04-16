@@ -459,6 +459,33 @@ impl AetherEngine {
 
     // ── Surgical patching ─────────────────────────────────────────────────────
 
+    /// ADR-003: Check available RAM before patching to prevent OOM.
+    /// Returns Ok(()) if the device has enough RAM, Err otherwise.
+    /// `old_file_size` and `patch_file_size` are the sizes of the input files.
+    pub fn check_patch_ram_feasibility(
+        &self,
+        old_file_size: u64,
+        patch_file_size: u64,
+    ) -> Result<(), AetherError> {
+        let total_needed = old_file_size.saturating_add(patch_file_size);
+        // With mmap (ADR-006), physical RAM pressure is much lower, but we still
+        // need a safety margin for the bspatch output buffer and OS overhead.
+        // Require at least 50% of available RAM as headroom.
+        let available_ram = get_available_ram();
+        let threshold = (available_ram as f64 * 0.5) as u64;
+        if total_needed > threshold {
+            return Err(AetherError::PatchError(format!(
+                "ADR-003: Insufficient RAM for patching. Need {} bytes, available threshold is {} bytes (50% of {} bytes available)",
+                total_needed, threshold, available_ram
+            )));
+        }
+        info!(
+            "ADR-003: RAM check passed — need {} bytes, threshold {} bytes",
+            total_needed, threshold
+        );
+        Ok(())
+    }
+
     pub fn apply_patch(
         &self,
         old_fd: i32,
@@ -815,6 +842,56 @@ fn encrypted_file_stream(
     }
     .boxed();
     stream
+}
+
+/// ADR-003: Query available physical RAM in bytes.
+/// Uses `/proc/meminfo` on Linux/Android and `sysctl` on macOS/iOS.
+fn get_available_ram() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        // Parse MemAvailable from /proc/meminfo (kB → bytes)
+        if let Ok(data) = std::fs::read_to_string("/proc/meminfo") {
+            for line in data.lines() {
+                if line.starts_with("MemAvailable:") {
+                    let kb: u64 = line
+                        .split_whitespace()
+                        .nth(1)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(0);
+                    return kb * 1024;
+                }
+            }
+        }
+        // Fallback: assume 2GB if we can't read meminfo
+        2 * 1024 * 1024 * 1024
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS/iOS: use sysctl hw.memsize as rough total, assume 50% available
+        // This is conservative; on iOS the actual free memory is lower but
+        // the OS will jetsam before we hit this threshold anyway.
+        let mut size: libc::size_t = 0;
+        let mut len = std::mem::size_of::<libc::size_t>();
+        let mib = [libc::CTL_HW, libc::HW_MEMSIZE];
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_ptr() as *mut libc::c_int,
+                2,
+                &mut size as *mut _ as *mut libc::c_void,
+                &mut len as *mut _ as *mut libc::c_void,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result == 0 {
+            // Assume 50% of total RAM is available as a conservative estimate
+            (size as u64 * 50) / 100
+        } else {
+            // Fallback: assume 2GB
+            2 * 1024 * 1024 * 1024
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

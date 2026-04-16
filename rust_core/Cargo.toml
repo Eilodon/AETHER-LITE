@@ -45,6 +45,8 @@ uuid        = { version = "1.7", features = ["v4", "fast-rng"] }
 # --- COMPRESSION & PATCHING ---
 zstd    = "0.13"
 qbsdiff = "1.4"
+memmap2 = "0.9"
+libc    = "0.2"
 
 # --- BRIDGE ---
 uniffi = { version = "0.26", features = ["tokio"] }
