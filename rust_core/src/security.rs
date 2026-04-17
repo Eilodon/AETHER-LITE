@@ -120,6 +120,14 @@ impl SecurityManager {
 
     /// Generate a signed ticket for outbound requests (legacy format, no counter).
     /// ADR-017: Use `generate_ticket_with_counter` for new implementations.
+    /// 
+    /// ## Deprecation Timeline
+    /// - v2.3.x (current): 4-field tickets accepted for backward compatibility
+    /// - v2.4.0 (planned): 4-field tickets deprecated, warning logged
+    /// - v2.5.0: 4-field tickets rejected entirely (monotonic counter mandatory)
+    /// 
+    /// Mixed-version deployments should migrate all peers to 5-field tickets
+    /// before v2.5.0 to avoid authentication failures.
     pub fn generate_ticket(
         model_id: &str,
         version: &str,

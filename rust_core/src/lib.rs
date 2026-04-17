@@ -1011,15 +1011,26 @@ async fn establish_noise_session_on_state(
     state
         .noise_sessions
         .insert(peer_id.to_string(), NoiseSessionEntry::new(session, current_unix_secs()));
-    let response = network::perform_noise_handshake(
-        peer_ip,
-        peer_port,
-        self_peer_id,
-        request,
-        Config::get_protocol_version(),
-    )
-    .await?;
-    complete_noise_handshake_on_state(state, peer_id, response).await
+    
+    // Perform network handshake and complete - cleanup on failure to prevent orphan sessions
+    let result = async {
+        let response = network::perform_noise_handshake(
+            peer_ip,
+            peer_port,
+            self_peer_id,
+            request,
+            Config::get_protocol_version(),
+        )
+        .await?;
+        complete_noise_handshake_on_state(state, peer_id, response).await
+    }.await;
+    
+    if result.is_err() {
+        // Clean up orphaned session on handshake failure to prevent memory leak
+        state.noise_sessions.remove(peer_id);
+    }
+    
+    result
 }
 
 // ── Axum handlers ─────────────────────────────────────────────────────────────

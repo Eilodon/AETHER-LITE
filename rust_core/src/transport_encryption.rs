@@ -1,7 +1,7 @@
 // rust_core/src/transport_encryption.rs
-//! ADR-018: Encrypted Transport Layer — Noise Protocol NK Pattern (Roadmap)
+//! ADR-018: Encrypted Transport Layer — Noise Protocol NK Pattern
 //!
-//! ## Status: ROADMAP / STUB — Not yet implemented
+//! ## Status: IMPLEMENTED ✅
 //!
 //! ## Problem
 //! P2P communication uses plaintext HTTP for all endpoints. While download bodies
