@@ -18,6 +18,7 @@ enum AetherError {
 };
 
 interface AetherEngine {
+    [Throws=AetherError]
     constructor();
 
     void set_self_peer_id(string peer_id);
@@ -39,6 +40,19 @@ interface AetherEngine {
 
     [Throws=AetherError]
     void register_peer_key(string peer_id, bytes shared_secret);
+
+    // ADR-021: Noise Protocol NK pattern FFI methods
+    [Throws=AetherError]
+    void register_peer_noise_static_key(string peer_id, bytes public_key);
+
+    [Throws=AetherError]
+    bytes initiate_noise_handshake(string peer_id);
+
+    [Throws=AetherError]
+    void complete_noise_handshake(string peer_id, bytes response);
+
+    // ADR-019: Enable Noise transport encryption
+    void enable_noise_transport();
 
     [Throws=AetherError]
     void grant_peer_model_access(string peer_id, string model_id);

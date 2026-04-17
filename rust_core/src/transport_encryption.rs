@@ -132,14 +132,44 @@ pub struct NoiseTransportSession {
     state: TransportState,
 }
 
+/// Configuration flag for ADR-019: Enable Noise NK transport encryption.
+/// 
+/// When true, Noise handshake is used for protected endpoints.
+/// When false (legacy), plaintext HTTP is used.
+/// 
+/// Migration path:
+/// - Phase 1 (HandshakeGated): Default false, opt-in via config
+/// - Phase 2 (Enforced): Always true, plaintext fallback removed
+static NOISE_ENABLED: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
+    std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
+
+/// Enable Noise NK transport encryption (ADR-019).
+/// 
+/// # Safety
+/// Call once during AetherEngine initialization. Do not toggle at runtime.
+pub fn enable_noise_transport() {
+    NOISE_ENABLED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Check if Noise transport is enabled.
+pub fn is_noise_enabled() -> bool {
+    NOISE_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Returns the current ADR-018 scope contract.
 ///
 /// This is intentionally explicit so future implementation work can assert
 /// against one stable source of truth rather than re-litigating scope in
 /// multiple files.
 pub fn current_scope() -> Adr018Scope {
+    let phase = if is_noise_enabled() {
+        Adr018Phase::HandshakeGated
+    } else {
+        Adr018Phase::ScopeLocked
+    };
+    
     Adr018Scope {
-        phase: Adr018Phase::ScopeLocked,
+        phase,
         protected_endpoints: &[
             ProtectedEndpoint::Identity,
             ProtectedEndpoint::Download,
