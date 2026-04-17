@@ -61,7 +61,12 @@ class AetherService : Service() {
     }
 
     private val scope        = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val rustEngine: AetherEngine by lazy { AetherEngine() }
+    private val rustEngine: AetherEngine by lazy {
+        // ADR-001: constructor now throws AetherError — catch and rethrow as IllegalStateException
+        try { AetherEngine() } catch (e: uniffi.aether_core.AetherError) {
+            throw IllegalStateException("AetherEngine init failed", e)
+        }
+    }
     private val manifestVerificationEngine by lazy { RustManifestVerificationEngine(rustEngine) }
     private val manifestSequenceStore by lazy {
         EncryptedManifestSequenceStore(applicationContext, MANIFEST_SEQUENCE_PREFS)

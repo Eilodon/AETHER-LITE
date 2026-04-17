@@ -355,7 +355,7 @@ final class RustCanonicalJSONTests: XCTestCase {
     /// output matching the local Swift canonical() implementation. If the
     /// two diverge, the onboarding payload fingerprint will mismatch.
     func test_rustEngineCanonicalMatchesSwiftCanonical() throws {
-        let engine = AetherEngine()
+        let engine = try AetherEngine()
         let input = #"{"z":"last","a":"first","full":{"url":"x","size":1}}"#
         let rustResult = try engine.canonicalizeJson(json: input)
 
@@ -364,7 +364,7 @@ final class RustCanonicalJSONTests: XCTestCase {
     }
 
     func test_rustEngineCanonicalSortsFlatKeys() throws {
-        let engine = AetherEngine()
+        let engine = try AetherEngine()
         let input = #"{"z":"last","a":"first","m":"mid"}"#
         let rustResult = try engine.canonicalizeJson(json: input)
         XCTAssertEqual(rustResult, #"{"a":"first","m":"mid","z":"last"}"#)

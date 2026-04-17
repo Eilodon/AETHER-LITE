@@ -39,7 +39,11 @@ final class AetherManager: ObservableObject {
         // Fix v2.3: engine initialisation can spin up a Tokio runtime — do it
         // on a background thread so we never block the main run loop.
         Task.detached(priority: .userInitiated) {
-            let eng = AetherEngine()
+            // ADR-001: constructor now throws AetherError
+            guard let eng = try? AetherEngine() else {
+                await MainActor.run { self.lastError = "AetherEngine init failed" }
+                return
+            }
 
             eng.setSelfPeerId(peerId: self.getStablePeerId())
             if let publicKey = Vault.shared.getPublicKeyData() {

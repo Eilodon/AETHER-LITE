@@ -23,7 +23,7 @@ fn sha256_hex(data: &[u8]) -> String {
 /// Create an AetherEngine with a dummy identity public key already set.
 /// Required since start_server() now enforces that the key is non-empty.
 fn new_engine_with_identity() -> aether_core::AetherEngine {
-    let engine = aether_core::AetherEngine::new();
+    let engine = aether_core::AetherEngine::new().unwrap();
     engine
         .set_self_identity_public_key(vec![0x04u8; 65])
         .unwrap();
@@ -394,8 +394,8 @@ mod engine_tests {
 
     #[test]
     fn two_engines_get_distinct_default_peer_ids() {
-        let e1 = AetherEngine::new();
-        let e2 = AetherEngine::new();
+        let e1 = AetherEngine::new().unwrap();
+        let e2 = AetherEngine::new().unwrap();
         // UUIDs are random — collision probability ≈ 0
         assert_ne!(
             e1.get_self_peer_id_for_test(),
@@ -405,20 +405,20 @@ mod engine_tests {
 
     #[test]
     fn set_peer_id_is_reflected() {
-        let engine = AetherEngine::new();
+        let engine = AetherEngine::new().unwrap();
         engine.set_self_peer_id("test-node-42".into());
         assert_eq!(engine.get_self_peer_id_for_test(), "test-node-42");
     }
 
     #[test]
     fn register_key_correct_length_succeeds() {
-        let e = AetherEngine::new();
+        let e = AetherEngine::new().unwrap();
         assert!(e.register_peer_key("p1".into(), vec![0xAAu8; 32]).is_ok());
     }
 
     #[test]
     fn register_key_wrong_lengths_fail() {
-        let e = AetherEngine::new();
+        let e = AetherEngine::new().unwrap();
         for len in [0usize, 16, 31, 33, 64] {
             assert!(
                 e.register_peer_key("p".into(), vec![0u8; len]).is_err(),
@@ -459,7 +459,7 @@ mod engine_tests {
 
     #[test]
     fn ping_unreachable_port_returns_false() {
-        let engine = AetherEngine::new();
+        let engine = AetherEngine::new().unwrap();
         // Port 1 is almost certainly closed/refused in test environments
         let alive = engine.ping_peer("127.0.0.1".into(), 1).unwrap();
         assert!(!alive);
@@ -467,7 +467,7 @@ mod engine_tests {
 
     #[test]
     fn verify_manifest_with_invalid_key_returns_error() {
-        let engine = AetherEngine::new();
+        let engine = AetherEngine::new().unwrap();
         let result = engine.verify_manifest(
             r#"{"id":"test","version":"1.0"}"#.into(),
             "deadbeef0011".into(),
@@ -478,7 +478,7 @@ mod engine_tests {
 
     #[test]
     fn decompress_pipe_roundtrip_via_engine() {
-        let engine = AetherEngine::new();
+        let engine = AetherEngine::new().unwrap();
         let data: Vec<u8> = b"engine decompress test payload".to_vec();
         let mut compressed = Vec::new();
         zstd::stream::copy_encode(std::io::Cursor::new(&data), &mut compressed, 3).unwrap();
@@ -548,7 +548,7 @@ mod hkdf_tests {
         use aether_core::security::SecureKey;
         use aether_core::AetherEngine;
 
-        let engine = AetherEngine::new();
+        let engine = AetherEngine::new().unwrap();
         let raw_secret = vec![0xDEu8; 32];
         engine
             .register_peer_key("peer-hkdf".into(), raw_secret.clone())
@@ -618,7 +618,7 @@ mod seeder_tests {
         .unwrap();
 
         // ── 4. Download via leecher engine ────────────────────────────────────
-        let leecher = AetherEngine::new();
+        let leecher = AetherEngine::new().unwrap();
         leecher.set_self_peer_id("leecher-1".into());
         leecher
             .register_peer_key("seeder-1".into(), raw_secret.clone())
@@ -704,7 +704,7 @@ mod seeder_tests {
             .unwrap()
             .into_raw_fd();
 
-        let leecher = AetherEngine::new();
+        let leecher = AetherEngine::new().unwrap();
         leecher.set_self_peer_id("leecher-trunc".into());
         leecher
             .register_peer_key("seeder-1".into(), raw_secret.clone())
@@ -769,7 +769,7 @@ mod seeder_tests {
                 &SecureKey(derived.to_vec()),
             )
             .unwrap();
-            let leecher = AetherEngine::new();
+            let leecher = AetherEngine::new().unwrap();
             leecher.set_self_peer_id("leecher-resume".into());
             leecher
                 .register_peer_key("seeder-1".into(), raw_secret.clone())
@@ -837,7 +837,7 @@ mod seeder_tests {
         )
         .unwrap();
 
-        let leecher = AetherEngine::new();
+        let leecher = AetherEngine::new().unwrap();
         leecher.set_self_peer_id("peer-basic".into());
         leecher
             .register_peer_key("seeder-1".into(), raw_secret.clone())
@@ -945,7 +945,7 @@ mod seeder_tests {
         .unwrap();
 
         // Leecher downloads
-        let leecher = AetherEngine::new();
+        let leecher = AetherEngine::new().unwrap();
         leecher.set_self_peer_id("leecher-flow".into());
         leecher
             .register_peer_key("seeder-1".into(), raw_secret.clone())
@@ -1013,7 +1013,7 @@ mod seeder_tests {
         )
         .unwrap();
 
-        let leecher = AetherEngine::new();
+        let leecher = AetherEngine::new().unwrap();
         leecher.set_self_peer_id("leecher-re".into());
         leecher
             .register_peer_key("seeder-1".into(), raw_secret.clone())
@@ -1121,7 +1121,7 @@ mod seeder_tests {
         )
         .unwrap();
 
-        let leecher = AetherEngine::new();
+        let leecher = AetherEngine::new().unwrap();
         leecher.set_self_peer_id("leecher-rst".into());
         leecher
             .register_peer_key("seeder-1".into(), raw_secret.clone())

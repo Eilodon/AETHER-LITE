@@ -160,6 +160,88 @@ jobs:
         working-directory: android
         run: ./gradlew :app:testDebugUnitTest
 
+  # ── Android instrumented tests (ADR-002) ──────────────────────────────────
+  android-instrumented-test:
+    name: Android instrumented tests
+    runs-on: macos-latest  # macOS required for hardware-accelerated emulator
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Make Gradle wrapper executable
+        working-directory: android
+        run: chmod +x gradlew
+
+      # ADR-002: Enable KVM for hardware-accelerated emulator on macOS runners
+      - name: Enable KVM group permissions
+        run: |
+          echo "KERNEL==\"kvm\", GROUP=\"kvm\", MODE=\"0666\", OPTIONS=\"static_node=kvm\"" | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run Android instrumented tests
+        working-directory: android
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: default
+          arch: x86_64
+          profile: Nexus 6
+          heap-size: 512M
+          ram-size: 4096M
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
+          disable-animations: true
+          script: ./gradlew :app:connectedDebugAndroidTest
+
+  # ── iOS XCTest (ADR-002) ──────────────────────────────────────────────────
+  ios-xctest:
+    name: iOS XCTest
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios-sim
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust_core/target
+          key: ios-test-cargo-${{ hashFiles('rust_core/Cargo.lock') }}
+
+      - name: Build Rust iOS library
+        working-directory: rust_core
+        run: cargo build --target aarch64-apple-ios-sim --release
+
+      - name: Run iOS XCTests
+        working-directory: ios/AetherLite
+        run: |
+          xcodebuild test \
+            -scheme AetherLite \
+            -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
+            -resultBundlePath TestResults.xcresult \
+            CODE_SIGNING_ALLOWED=NO | xcpretty
+
   # ── Python forge tool ──────────────────────────────────────────────────────
   python:
     name: Python forge tool
@@ -190,16 +272,18 @@ jobs:
   ci-pass:
     name: CI passed
     runs-on: ubuntu-latest
-    needs: [rust, rust-android, rust-ios, android-unit-test, python]
+    needs: [rust, rust-android, rust-ios, android-unit-test, android-instrumented-test, ios-xctest, python]
     if: always()
     steps:
       - name: Check all jobs
         run: |
-          if [[ "${{ needs.rust.result }}"         != "success" ||
-                "${{ needs.rust-android.result }}" != "success" ||
-                "${{ needs.rust-ios.result }}"     != "success" ||
-                "${{ needs.android-unit-test.result }}" != "success" ||
-                "${{ needs.python.result }}"       != "success" ]]; then
+          if [[ "${{ needs.rust.result }}"                    != "success" ||
+                "${{ needs.rust-android.result }}"          != "success" ||
+                "${{ needs.rust-ios.result }}"              != "success" ||
+                "${{ needs.android-unit-test.result }}"     != "success" ||
+                "${{ needs.android-instrumented-test.result }}" != "success" ||
+                "${{ needs.ios-xctest.result }}"            != "success" ||
+                "${{ needs.python.result }}"                != "success" ]]; then
             echo "One or more jobs failed"
             exit 1
           fi

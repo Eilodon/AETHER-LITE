@@ -234,15 +234,15 @@ try await AetherManager.shared.applySmartPatch(
 
 ## Test Coverage
 
-| Scope | Tests |
-|-------|-------|
-| Rust unit | 47 |
-| Rust integration | 37 |
-| Android JVM unit | 19 |
-| Android instrumented | 6 |
-| iOS XCTest | 23 |
-| Python (forge tool) | 37 |
-| **Total** | **169** |
+| Scope | Tests | CI-enforced |
+|-------|-------|-------------|
+| Rust unit | 47 | ✅ `cargo test` |
+| Rust integration | 37 | ✅ `cargo test` |
+| Android JVM unit | 19 | ✅ `gradlew testDebugUnitTest` |
+| Android instrumented | 6 | ✅ `gradlew connectedDebugAndroidTest` |
+| iOS XCTest | 23 | ✅ `xcodebuild test` |
+| Python (forge tool) | 37 | ✅ `pytest forge_test.py` |
+| **Total** | **169** | **All CI-enforced** |
 
 ---
 
