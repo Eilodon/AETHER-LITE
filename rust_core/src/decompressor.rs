@@ -41,12 +41,17 @@ pub fn decompress_zstd_fds(compressed_fd: i32, output_fd: i32) -> Result<u64, Ae
             let limit = std::cmp::min(Config::MAX_DECOMPRESSED_SIZE, safe);
             info!(
                 "ADR-004: disk free={} bytes, dynamic limit={} bytes (cap={})",
-                free, limit, Config::MAX_DECOMPRESSED_SIZE
+                free,
+                limit,
+                Config::MAX_DECOMPRESSED_SIZE
             );
             limit
         }
         Err(e) => {
-            warn!("ADR-004: cannot query disk space ({}), falling back to static limit", e);
+            warn!(
+                "ADR-004: cannot query disk space ({}), falling back to static limit",
+                e
+            );
             Config::MAX_DECOMPRESSED_SIZE
         }
     };

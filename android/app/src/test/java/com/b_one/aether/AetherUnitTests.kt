@@ -1,5 +1,8 @@
 package com.b_one.aether
 
+import com.b_one.aether.service.ManifestSequenceStore
+import com.b_one.aether.service.ManifestVerification
+import com.b_one.aether.service.ManifestVerificationEngine
 import com.b_one.aether.security.PeerTrust
 import com.b_one.aether.security.PeerTrustMode
 import org.junit.Assert.*
@@ -11,6 +14,42 @@ import java.security.MessageDigest
 
 @RunWith(JUnit4::class)
 class AetherUnitTests {
+
+    private class FakeManifestVerificationEngine : ManifestVerificationEngine {
+        val seeded = mutableListOf<Pair<String, ULong>>()
+        val verified = mutableListOf<Pair<String, ULong>>()
+        var canonicalResult = "{}"
+        var verifyError: Exception? = null
+
+        override fun canonicalizeJson(json: String): String = canonicalResult
+
+        override fun seedManifestSequence(modelId: String, sequence: ULong) {
+            seeded += modelId to sequence
+        }
+
+        override fun verifyManifestWithSequence(
+            modelId: String,
+            sequence: ULong,
+            canonicalJson: String,
+            sigHex: String,
+            publicKeyDer: ByteArray
+        ) {
+            verifyError?.let { throw it }
+            verified += modelId to sequence
+        }
+    }
+
+    private class FakeManifestSequenceStore(
+        private val values: MutableMap<String, Long> = mutableMapOf()
+    ) : ManifestSequenceStore {
+        override fun getLastAccepted(modelId: String): Long = values[modelId] ?: 0L
+
+        override fun persistAccepted(modelId: String, sequence: Long) {
+            values[modelId] = sequence
+        }
+
+        fun persisted(modelId: String): Long? = values[modelId]
+    }
 
     private fun hexToBytes(hex: String): ByteArray {
         require(hex.length % 2 == 0)
@@ -197,5 +236,56 @@ class AetherUnitTests {
     fun `toFixedBytes throws for oversized value`() {
         val tooBig = BigInteger(ByteArray(33) { 0x01.toByte() })
         tooBig.toFixedBytes(32)
+    }
+
+    @Test
+    fun `manifest verification seeds previous sequence and persists newer accepted sequence`() {
+        val engine = FakeManifestVerificationEngine().apply {
+            canonicalResult = """{"id":"llm-mini","sequence":7}"""
+        }
+        val store = FakeManifestSequenceStore(mutableMapOf("llm-mini" to 6L))
+        val manifestJson = """
+            {"payload":{"id":"llm-mini","sequence":7},"signature":"abcd"}
+        """.trimIndent()
+
+        val parsed = ManifestVerification.parseAndVerifyForUpdate(
+            manifestJson = manifestJson,
+            adminPublicKey = byteArrayOf(1, 2, 3),
+            engine = engine,
+            sequenceStore = store
+        )
+
+        assertEquals("llm-mini", parsed.modelId)
+        assertEquals(7L, parsed.sequence)
+        assertEquals(listOf("llm-mini" to 6uL), engine.seeded)
+        assertEquals(listOf("llm-mini" to 7uL), engine.verified)
+        assertEquals(7L, store.persisted("llm-mini"))
+    }
+
+    @Test
+    fun `manifest rollback rejection does not persist downgraded sequence`() {
+        val engine = FakeManifestVerificationEngine().apply {
+            canonicalResult = """{"id":"llm-mini","sequence":5}"""
+            verifyError = SecurityException(
+                "Manifest sequence 5 is not greater than last accepted 6 (ADR-016)"
+            )
+        }
+        val store = FakeManifestSequenceStore(mutableMapOf("llm-mini" to 6L))
+        val manifestJson = """
+            {"payload":{"id":"llm-mini","sequence":5},"signature":"abcd"}
+        """.trimIndent()
+
+        val error = assertThrows(SecurityException::class.java) {
+            ManifestVerification.parseAndVerifyForUpdate(
+                manifestJson = manifestJson,
+                adminPublicKey = byteArrayOf(1, 2, 3),
+                engine = engine,
+                sequenceStore = store
+            )
+        }
+
+        assertTrue(error.message!!.contains("not greater than last accepted 6"))
+        assertEquals(listOf("llm-mini" to 6uL), engine.seeded)
+        assertEquals(6L, store.persisted("llm-mini"))
     }
 }

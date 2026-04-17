@@ -15,6 +15,17 @@
 //! - 1-RTT handshake (initiator sends ephemeral key, responder sends static+ephemeral)
 //! - Preserves existing ChaCha20 as application-layer encryption (defense-in-depth)
 //!
+//! ## Scope Lock (Cycle #2)
+//! This module now acts as the ADR-018 scope contract for C1/C2:
+//! - **In scope for C1:** `/identity`, `/download`, ping/heartbeat transport, request
+//!   headers, query params, and response metadata currently visible over plaintext TCP.
+//! - **In scope for C2:** per-connection ephemeral Noise handshake and strict separation
+//!   between Noise static keys and the existing HMAC / ChaCha20 derivation keys.
+//! - **Migration constraint:** plaintext fallback may exist only during transition and must
+//!   be explicitly gated. It is not the end state.
+//! - **Out of scope:** CDN/manifest distribution, `forge.py`, ECDSA manifest signing, and
+//!   removal of application-layer ChaCha20 defense-in-depth in this cycle.
+//!
 //! ## Implementation Roadmap
 //!
 //! ### Phase 1: Dependencies and Types
@@ -49,77 +60,336 @@
 //! - Pure ChaCha20 without handshake: No forward secrecy, no authentication
 
 use crate::error::AetherError;
+use crate::security::SecureKey;
+use snow::{params::NoiseParams, Builder, HandshakeState, TransportState};
+
+const NOISE_NK_PARAMS: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
+const NOISE_STATIC_KEY_LEN: usize = 32;
+const NOISE_HANDSHAKE_BUFFER_LEN: usize = 96;
+const NOISE_TAG_LEN: usize = 16;
+
+/// ADR-018: Explicitly tracked transport endpoints that must move off plaintext
+/// TCP in order to close C1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectedEndpoint {
+    Identity,
+    Download,
+    Ping,
+}
+
+/// ADR-018: Current implementation phase for the transport migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Adr018Phase {
+    /// Scope and boundaries are fixed, but runtime behavior is still legacy plaintext.
+    ScopeLocked,
+    /// Noise handshake exists, but only behind an explicit migration gate.
+    HandshakeGated,
+    /// All in-scope transport runs inside Noise-framed encrypted transport.
+    Enforced,
+}
+
+/// ADR-018: Forward secrecy requirement needed to close C2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardSecrecyRequirement {
+    /// Legacy mode: static-only derivation, known insufficient.
+    StaticOnlyLegacy,
+    /// Target mode: per-connection ephemeral handshake material is mandatory.
+    EphemeralPerConnection,
+}
+
+/// ADR-018: Frozen scope contract for the dedicated C1/C2 implementation cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Adr018Scope {
+    pub phase: Adr018Phase,
+    pub protected_endpoints: &'static [ProtectedEndpoint],
+    pub forward_secrecy: ForwardSecrecyRequirement,
+    pub preserves_chacha20_defense_in_depth: bool,
+    pub allows_plaintext_migration_fallback: bool,
+    pub excludes_cdn_and_manifest_distribution: bool,
+    pub requires_separate_noise_static_keys: bool,
+}
+
+pub struct NoiseStaticKeypair {
+    pub private_key: SecureKey,
+    pub public_key: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum NoiseRole {
+    Initiator,
+    Responder,
+}
+
+pub struct NoiseHandshakeSession {
+    role: NoiseRole,
+    step: u8,
+    state: HandshakeState,
+}
+
+pub struct NoiseTransportSession {
+    #[allow(dead_code)]
+    role: NoiseRole,
+    state: TransportState,
+}
+
+/// Returns the current ADR-018 scope contract.
+///
+/// This is intentionally explicit so future implementation work can assert
+/// against one stable source of truth rather than re-litigating scope in
+/// multiple files.
+pub fn current_scope() -> Adr018Scope {
+    Adr018Scope {
+        phase: Adr018Phase::ScopeLocked,
+        protected_endpoints: &[
+            ProtectedEndpoint::Identity,
+            ProtectedEndpoint::Download,
+            ProtectedEndpoint::Ping,
+        ],
+        forward_secrecy: ForwardSecrecyRequirement::EphemeralPerConnection,
+        preserves_chacha20_defense_in_depth: true,
+        allows_plaintext_migration_fallback: true,
+        excludes_cdn_and_manifest_distribution: true,
+        requires_separate_noise_static_keys: true,
+    }
+}
+
+pub fn noise_static_public_key_len() -> usize {
+    NOISE_STATIC_KEY_LEN
+}
+
+pub fn validate_static_public_key(key: &[u8]) -> Result<(), AetherError> {
+    if key.len() != NOISE_STATIC_KEY_LEN {
+        return Err(AetherError::KeyExchangeFailed);
+    }
+    Ok(())
+}
+
+pub fn generate_static_keypair() -> Result<NoiseStaticKeypair, AetherError> {
+    let params = parse_noise_params()?;
+    let builder = Builder::new(params);
+    let keypair = builder
+        .generate_keypair()
+        .map_err(|e| AetherError::InternalError(format!("ADR-018 key generation failed: {e}")))?;
+    validate_static_public_key(&keypair.private)?;
+    validate_static_public_key(&keypair.public)?;
+    Ok(NoiseStaticKeypair {
+        private_key: SecureKey(keypair.private),
+        public_key: keypair.public,
+    })
+}
 
 /// Stub: Noise Protocol NK pattern session state.
-/// Full implementation deferred to dedicated architectural cycle.
 pub enum NoiseSession {
     /// Handshake not yet started
     Uninitialized,
     /// Handshake in progress
-    Handshaking,
+    Handshaking(NoiseHandshakeSession),
     /// Handshake complete, transport encryption active
-    Established,
+    Established(NoiseTransportSession),
+    #[doc(hidden)]
+    Transitioning,
 }
 
-/// Stub: Initialize Noise Protocol responder (seeder side).
-/// Full implementation deferred.
-pub fn init_noise_responder(_static_key: &[u8]) -> Result<NoiseSession, AetherError> {
-    // ROADMAP: Implement using snow crate
-    // 1. Load static private key for NK pattern
-    // 2. Create responder state machine
-    // 3. Return NoiseSession::Handshaking
-    Err(AetherError::InternalError(
-        "ADR-018: Encrypted transport not yet implemented (roadmap)".into(),
-    ))
+/// Initialize Noise Protocol responder (seeder side).
+pub fn init_noise_responder(static_key: &[u8]) -> Result<NoiseSession, AetherError> {
+    validate_static_public_key(static_key)?;
+    let params = parse_noise_params()?;
+    let state = Builder::new(params)
+        .local_private_key(static_key)
+        .build_responder()
+        .map_err(|e| AetherError::InternalError(format!("ADR-018 responder init failed: {e}")))?;
+    Ok(NoiseSession::Handshaking(NoiseHandshakeSession {
+        role: NoiseRole::Responder,
+        step: 0,
+        state,
+    }))
 }
 
-/// Stub: Initialize Noise Protocol initiator (leecher side).
-/// Full implementation deferred.
-pub fn init_noise_initiator(_remote_static_key: &[u8]) -> Result<NoiseSession, AetherError> {
-    // ROADMAP: Implement using snow crate
-    // 1. Generate ephemeral keypair
-    // 2. Create initiator state machine for NK pattern
-    // 3. Send first handshake message
-    // 4. Return NoiseSession::Handshaking
-    Err(AetherError::InternalError(
-        "ADR-018: Encrypted transport not yet implemented (roadmap)".into(),
-    ))
+/// Initialize Noise Protocol initiator (leecher side).
+pub fn init_noise_initiator(remote_static_key: &[u8]) -> Result<NoiseSession, AetherError> {
+    validate_static_public_key(remote_static_key)?;
+    let params = parse_noise_params()?;
+    let state = Builder::new(params)
+        .remote_public_key(remote_static_key)
+        .build_initiator()
+        .map_err(|e| AetherError::InternalError(format!("ADR-018 initiator init failed: {e}")))?;
+    Ok(NoiseSession::Handshaking(NoiseHandshakeSession {
+        role: NoiseRole::Initiator,
+        step: 0,
+        state,
+    }))
 }
 
-/// Stub: Perform Noise handshake.
-/// Full implementation deferred.
-pub fn perform_handshake(_session: &mut NoiseSession, _data: &[u8]) -> Result<Vec<u8>, AetherError> {
-    // ROADMAP: Implement handshake state machine
-    // 1. Process incoming handshake data
-    // 2. Advance state machine
-    // 3. Return response data or empty vec if complete
-    Err(AetherError::InternalError(
-        "ADR-018: Encrypted transport not yet implemented (roadmap)".into(),
-    ))
+/// Perform one Noise handshake step.
+pub fn perform_handshake(session: &mut NoiseSession, data: &[u8]) -> Result<Vec<u8>, AetherError> {
+    let current = std::mem::replace(session, NoiseSession::Transitioning);
+    let (next, response) = match current {
+        NoiseSession::Handshaking(mut hs) => match hs.role {
+            NoiseRole::Initiator => match hs.step {
+                0 => {
+                    if !data.is_empty() {
+                        return Err(AetherError::SecurityError(
+                            "ADR-018 initiator expected empty input on first handshake step".into(),
+                        ));
+                    }
+                    let response = write_handshake_message(&mut hs.state)?;
+                    hs.step = 1;
+                    (NoiseSession::Handshaking(hs), response)
+                }
+                1 => {
+                    if data.is_empty() {
+                        return Err(AetherError::SecurityError(
+                            "ADR-018 initiator expected responder handshake payload".into(),
+                        ));
+                    }
+                    read_handshake_message(&mut hs.state, data)?;
+                    let transport = hs.state.into_transport_mode().map_err(|e| {
+                        AetherError::InternalError(format!(
+                            "ADR-018 initiator transport upgrade failed: {e}"
+                        ))
+                    })?;
+                    (
+                        NoiseSession::Established(NoiseTransportSession {
+                            role: NoiseRole::Initiator,
+                            state: transport,
+                        }),
+                        Vec::new(),
+                    )
+                }
+                _ => {
+                    return Err(AetherError::InternalError(
+                        "ADR-018 initiator handshake already completed".into(),
+                    ))
+                }
+            },
+            NoiseRole::Responder => match hs.step {
+                0 => {
+                    if data.is_empty() {
+                        return Err(AetherError::SecurityError(
+                            "ADR-018 responder expected initiator handshake payload".into(),
+                        ));
+                    }
+                    read_handshake_message(&mut hs.state, data)?;
+                    let response = write_handshake_message(&mut hs.state)?;
+                    let transport = hs.state.into_transport_mode().map_err(|e| {
+                        AetherError::InternalError(format!(
+                            "ADR-018 responder transport upgrade failed: {e}"
+                        ))
+                    })?;
+                    (
+                        NoiseSession::Established(NoiseTransportSession {
+                            role: NoiseRole::Responder,
+                            state: transport,
+                        }),
+                        response,
+                    )
+                }
+                _ => {
+                    return Err(AetherError::InternalError(
+                        "ADR-018 responder handshake already completed".into(),
+                    ))
+                }
+            },
+        },
+        NoiseSession::Established(ts) => {
+            *session = NoiseSession::Established(ts);
+            return Err(AetherError::InternalError(
+                "ADR-018 handshake called on established session".into(),
+            ));
+        }
+        NoiseSession::Uninitialized => {
+            *session = NoiseSession::Uninitialized;
+            return Err(AetherError::InternalError(
+                "ADR-018 handshake called on uninitialized session".into(),
+            ));
+        }
+        NoiseSession::Transitioning => {
+            *session = NoiseSession::Transitioning;
+            return Err(AetherError::InternalError(
+                "ADR-018 session re-entry detected".into(),
+            ));
+        }
+    };
+    *session = next;
+    Ok(response)
 }
 
-/// Stub: Encrypt data using established Noise session.
-/// Full implementation deferred.
-pub fn encrypt(_session: &NoiseSession, _plaintext: &[u8]) -> Result<Vec<u8>, AetherError> {
-    // ROADMAP: Implement transport encryption
-    // 1. Verify session is in Established state
-    // 2. Use snow::TransportState::write_message
-    // 3. Return ciphertext with length prefix
-    Err(AetherError::InternalError(
-        "ADR-018: Encrypted transport not yet implemented (roadmap)".into(),
-    ))
+/// Encrypt data using established Noise session.
+pub fn encrypt(session: &mut NoiseSession, plaintext: &[u8]) -> Result<Vec<u8>, AetherError> {
+    let current = std::mem::replace(session, NoiseSession::Transitioning);
+    let (next, ciphertext) = match current {
+        NoiseSession::Established(mut ts) => {
+            let mut out = vec![0u8; plaintext.len() + NOISE_TAG_LEN];
+            let n = ts
+                .state
+                .write_message(plaintext, &mut out)
+                .map_err(|e| AetherError::InternalError(format!("ADR-018 encrypt failed: {e}")))?;
+            out.truncate(n);
+            let next = NoiseSession::Established(ts);
+            (next, out)
+        }
+        other => {
+            *session = other;
+            return Err(AetherError::InternalError(
+                "ADR-018 encrypt requires established Noise session".into(),
+            ));
+        }
+    };
+    *session = next;
+    Ok(ciphertext)
 }
 
-/// Stub: Decrypt data using established Noise session.
-/// Full implementation deferred.
-pub fn decrypt(_session: &NoiseSession, _ciphertext: &[u8]) -> Result<Vec<u8>, AetherError> {
-    // ROADMAP: Implement transport decryption
-    // 1. Verify session is in Established state
-    // 2. Use snow::TransportState::read_message
-    // 3. Return plaintext
-    Err(AetherError::InternalError(
-        "ADR-018: Encrypted transport not yet implemented (roadmap)".into(),
-    ))
+/// Decrypt data using established Noise session.
+pub fn decrypt(session: &mut NoiseSession, ciphertext: &[u8]) -> Result<Vec<u8>, AetherError> {
+    let current = std::mem::replace(session, NoiseSession::Transitioning);
+    let (next, plaintext) = match current {
+        NoiseSession::Established(mut ts) => {
+            let mut out = vec![0u8; ciphertext.len()];
+            let n = ts
+                .state
+                .read_message(ciphertext, &mut out)
+                .map_err(|e| AetherError::InternalError(format!("ADR-018 decrypt failed: {e}")))?;
+            out.truncate(n);
+            let next = NoiseSession::Established(ts);
+            (next, out)
+        }
+        other => {
+            *session = other;
+            return Err(AetherError::InternalError(
+                "ADR-018 decrypt requires established Noise session".into(),
+            ));
+        }
+    };
+    *session = next;
+    Ok(plaintext)
+}
+
+fn parse_noise_params() -> Result<NoiseParams, AetherError> {
+    NOISE_NK_PARAMS
+        .parse()
+        .map_err(|e| AetherError::InternalError(format!("ADR-018 invalid Noise params: {e}")))
+}
+
+fn read_handshake_message(state: &mut HandshakeState, data: &[u8]) -> Result<(), AetherError> {
+    let mut payload = vec![0u8; NOISE_HANDSHAKE_BUFFER_LEN];
+    let payload_len = state
+        .read_message(data, &mut payload)
+        .map_err(|e| AetherError::SecurityError(format!("ADR-018 handshake read failed: {e}")))?;
+    if payload_len != 0 {
+        return Err(AetherError::SecurityError(
+            "ADR-018 handshake payload must be empty during bootstrap".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn write_handshake_message(state: &mut HandshakeState) -> Result<Vec<u8>, AetherError> {
+    let mut out = vec![0u8; NOISE_HANDSHAKE_BUFFER_LEN];
+    let n = state
+        .write_message(&[], &mut out)
+        .map_err(|e| AetherError::InternalError(format!("ADR-018 handshake write failed: {e}")))?;
+    out.truncate(n);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -127,12 +397,62 @@ mod tests {
     use super::*;
 
     #[test]
-    fn noise_stub_returns_roadmap_error() {
-        let result = init_noise_responder(&[0u8; 32]);
-        assert!(matches!(result, Err(AetherError::InternalError(_))));
-        if let Err(AetherError::InternalError(msg)) = result {
-            assert!(msg.contains("ADR-018"));
-            assert!(msg.contains("roadmap"));
-        }
+    fn generated_noise_keypair_has_expected_lengths() {
+        let keypair = generate_static_keypair().unwrap();
+        assert_eq!(keypair.private_key.0.len(), noise_static_public_key_len());
+        assert_eq!(keypair.public_key.len(), noise_static_public_key_len());
+    }
+
+    #[test]
+    fn adr018_scope_locks_c1_endpoints() {
+        let scope = current_scope();
+        assert_eq!(scope.phase, Adr018Phase::ScopeLocked);
+        assert_eq!(
+            scope.protected_endpoints,
+            &[
+                ProtectedEndpoint::Identity,
+                ProtectedEndpoint::Download,
+                ProtectedEndpoint::Ping,
+            ]
+        );
+        assert!(scope.excludes_cdn_and_manifest_distribution);
+    }
+
+    #[test]
+    fn adr018_scope_locks_c2_requirements() {
+        let scope = current_scope();
+        assert_eq!(
+            scope.forward_secrecy,
+            ForwardSecrecyRequirement::EphemeralPerConnection
+        );
+        assert!(scope.requires_separate_noise_static_keys);
+        assert!(scope.preserves_chacha20_defense_in_depth);
+    }
+
+    #[test]
+    fn invalid_static_key_length_is_rejected() {
+        let result = init_noise_initiator(&[0u8; 31]);
+        assert!(matches!(result, Err(AetherError::KeyExchangeFailed)));
+    }
+
+    #[test]
+    fn noise_nk_handshake_and_transport_roundtrip() {
+        let responder_keys = generate_static_keypair().unwrap();
+        let mut initiator =
+            init_noise_initiator(&responder_keys.public_key).expect("initiator should build");
+        let mut responder =
+            init_noise_responder(&responder_keys.private_key.0).expect("responder should build");
+
+        let msg1 = perform_handshake(&mut initiator, &[]).expect("initiator writes msg1");
+        assert!(!msg1.is_empty());
+        let msg2 =
+            perform_handshake(&mut responder, &msg1).expect("responder reads msg1 and writes msg2");
+        assert!(!msg2.is_empty());
+        let done = perform_handshake(&mut initiator, &msg2).expect("initiator finishes");
+        assert!(done.is_empty());
+
+        let ciphertext = encrypt(&mut initiator, b"hello-noise").expect("encrypt");
+        let plaintext = decrypt(&mut responder, &ciphertext).expect("decrypt");
+        assert_eq!(plaintext, b"hello-noise");
     }
 }

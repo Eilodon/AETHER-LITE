@@ -18,7 +18,7 @@ pub mod error;
 mod network;
 pub mod patcher;
 pub mod security;
-pub mod transport_encryption;  // ADR-018: Noise Protocol stub (roadmap)
+pub mod transport_encryption; // ADR-018: Noise Protocol stub (roadmap)
 
 use crate::canonical_json::canonicalize_json;
 use crate::config::Config;
@@ -62,6 +62,9 @@ struct AppState {
     // Replaces the previous separate peer_keys + peer_permissions + peer_limiters maps,
     // which required 3 non-atomic remove() calls in revoke_peer().
     peers: DashMap<String, PeerEntry>,
+    /// Per-peer limiter state for unknown / unauthenticated peers.
+    /// Keeps pre-auth rate limiting separate from authenticated peer state.
+    unauth_limiters: DashMap<String, PeerLimiterEntry>,
     seen_tickets: DashMap<String, u64>,
     /// ADR-007: CancellationToken replaces Arc&lt;Notify&gt; for graceful shutdown.
     /// Per-session token created by start_server(), cancelled by stop_server().
@@ -74,8 +77,8 @@ struct AppState {
     serve_files: DashMap<String, PathBuf>,
     /// ADR-015: Per-peer consecutive ticket verification failure counter.
     /// After MAX_TICKET_VERIFY_FAILURES consecutive failures, the peer is
-    /// temporarily blocked from attempting further verifications.
-    ticket_verify_failures: DashMap<String, u32>,
+    /// temporarily blocked from attempting further verifications until TTL expiry.
+    ticket_verify_failures: DashMap<String, TicketVerifyFailureEntry>,
     /// ADR-016: Last accepted manifest sequence per model_id.
     /// Rejects manifests with sequence <= stored value (rollback protection).
     manifest_sequences: DashMap<String, u64>,
@@ -96,11 +99,17 @@ struct PeerEntry {
 struct PeerKeys {
     auth_key: SecureKey,
     transport_key: SecureKey,
+    noise_remote_static_key: Option<Vec<u8>>,
 }
 
 struct PeerLimiterEntry {
     semaphore: Arc<Semaphore>,
     last_seen_unix_secs: AtomicU64,
+}
+
+struct TicketVerifyFailureEntry {
+    count: u32,
+    last_failure_unix_secs: u64,
 }
 
 impl PeerLimiterEntry {
@@ -145,6 +154,9 @@ pub struct AetherEngine {
     /// Fix v2.3: node's own UUID; sent as `?pid=` in outbound requests.
     self_peer_id: Arc<RwLock<String>>,
     self_public_key_x962: Arc<RwLock<Vec<u8>>>,
+    #[allow(dead_code)]
+    noise_static_private_key: Arc<RwLock<SecureKey>>,
+    noise_static_public_key: Arc<RwLock<Vec<u8>>>,
     /// Port assigned by the OS when `start_server()` is called.
     /// Used by `heartbeat()` to probe the actual TCP server.
     bound_port: Arc<RwLock<Option<u16>>>,
@@ -168,10 +180,13 @@ impl AetherEngine {
         }
 
         let default_id = uuid::Uuid::new_v4().to_string();
+        let noise_static = transport_encryption::generate_static_keypair()
+            .expect("ADR-018 Noise static key init failed");
 
         Self {
             state: Arc::new(AppState {
                 peers: DashMap::new(),
+                unauth_limiters: DashMap::new(),
                 seen_tickets: DashMap::new(),
                 shutdown_token: RwLock::new(CancellationToken::new()),
                 download_limiter: Arc::new(Semaphore::new(Config::MAX_CONCURRENT_DOWNLOADS)),
@@ -183,6 +198,8 @@ impl AetherEngine {
             rt: Arc::new(Runtime::new().expect("Tokio runtime init failed")),
             self_peer_id: Arc::new(RwLock::new(default_id)),
             self_public_key_x962: Arc::new(RwLock::new(Vec::new())),
+            noise_static_private_key: Arc::new(RwLock::new(noise_static.private_key)),
+            noise_static_public_key: Arc::new(RwLock::new(noise_static.public_key)),
             bound_port: Arc::new(RwLock::new(None)),
         }
     }
@@ -281,6 +298,15 @@ impl AetherEngine {
                         eviction_state
                             .peers
                             .retain(|_, entry| !entry.limiter.is_idle_expired(now));
+                        eviction_state
+                            .unauth_limiters
+                            .retain(|_, entry| !entry.is_idle_expired(now));
+                        eviction_state
+                            .ticket_verify_failures
+                            .retain(|_, entry| {
+                                now.saturating_sub(entry.last_failure_unix_secs)
+                                    < Config::MAX_TICKET_VERIFY_FAILURE_TTL_SECS
+                            });
                     }
                 }
             }
@@ -356,9 +382,11 @@ impl AetherEngine {
         // update keys but preserve permissions and limiter.
         match self.state.peers.entry(peer_id.clone()) {
             dashmap::mapref::entry::Entry::Occupied(mut e) => {
+                let existing_noise_key = e.get().keys.noise_remote_static_key.clone();
                 e.get_mut().keys = PeerKeys {
                     auth_key: SecureKey(auth_key.to_vec()),
                     transport_key: SecureKey(transport_key.to_vec()),
+                    noise_remote_static_key: existing_noise_key,
                 };
             }
             dashmap::mapref::entry::Entry::Vacant(e) => {
@@ -366,12 +394,30 @@ impl AetherEngine {
                     keys: PeerKeys {
                         auth_key: SecureKey(auth_key.to_vec()),
                         transport_key: SecureKey(transport_key.to_vec()),
+                        noise_remote_static_key: None,
                     },
                     permissions: HashSet::new(),
                     limiter: PeerLimiterEntry::new(now),
                 });
             }
         }
+        Ok(())
+    }
+
+    /// ADR-018: Store a peer's Noise static public key separately from the
+    /// existing HMAC/ChaCha20 key material. This keeps the migration path for
+    /// C1/C2 explicit without reusing legacy transport secrets.
+    pub fn register_peer_noise_static_key(
+        &self,
+        peer_id: String,
+        remote_static_key: Vec<u8>,
+    ) -> Result<(), AetherError> {
+        transport_encryption::validate_static_public_key(&remote_static_key)?;
+        let mut entry = match self.state.peers.get_mut(&peer_id) {
+            Some(e) => e,
+            None => return Err(AetherError::PeerNotFound),
+        };
+        entry.keys.noise_remote_static_key = Some(remote_static_key);
         Ok(())
     }
 
@@ -435,9 +481,10 @@ impl AetherEngine {
             .map(|v| *v)
             .unwrap_or(0);
         if sequence <= last_accepted {
-            return Err(AetherError::SecurityError(
-                format!("Manifest sequence {} is not greater than last accepted {} (ADR-016)", sequence, last_accepted)
-            ));
+            return Err(AetherError::SecurityError(format!(
+                "Manifest sequence {} is not greater than last accepted {} (ADR-016)",
+                sequence, last_accepted
+            )));
         }
 
         // Update stored sequence atomically
@@ -521,19 +568,21 @@ impl AetherEngine {
         // Second: check monotonic counter if present (ADR-017)
         let counter = SecurityManager::extract_counter(ticket)?;
         if let Some(cnt) = counter {
-            let last_accepted = self
-                .state
-                .ticket_counters
-                .get(issuer_peer_id)
-                .map(|v| *v)
-                .unwrap_or(0);
-            if cnt <= last_accepted {
-                return Err(AetherError::SecurityError(
-                    format!("Ticket counter {} is not greater than last accepted {} (ADR-017)", cnt, last_accepted)
-                ));
+            match self.state.ticket_counters.entry(issuer_peer_id.to_string()) {
+                dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                    let last_accepted = *entry.get();
+                    if cnt <= last_accepted {
+                        return Err(AetherError::SecurityError(format!(
+                            "Ticket counter {} is not greater than last accepted {} (ADR-017)",
+                            cnt, last_accepted
+                        )));
+                    }
+                    entry.insert(cnt);
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(cnt);
+                }
             }
-            // Update stored counter atomically
-            self.state.ticket_counters.insert(issuer_peer_id.to_string(), cnt);
         }
         // If counter is None (legacy ticket), allow it (backward compatibility)
         Ok(())
@@ -707,6 +756,11 @@ impl AetherEngine {
     }
 
     #[doc(hidden)]
+    pub fn get_noise_static_public_key_for_test(&self) -> Vec<u8> {
+        self.noise_static_public_key.read().unwrap().clone()
+    }
+
+    #[doc(hidden)]
     pub fn get_bound_port_for_test(&self) -> Option<u16> {
         *self.bound_port.read().unwrap()
     }
@@ -739,22 +793,17 @@ async fn download_handler(
     // ── Per-peer rate limit ─────────────────────────────────────────────────
     // SECURITY: Prevent a single peer from exhausting all global download slots
     let now = current_unix_secs();
-    let peer_limiter = {
-        // ADR-012: limiter is inside the unified PeerEntry
+    let peer_limiter = if let Some(peer_ref) = state.app.peers.get(&peer_id) {
+        peer_ref.value().limiter.touch(now);
+        peer_ref.value().limiter.semaphore.clone()
+    } else {
         let entry = state
             .app
-            .peers
+            .unauth_limiters
             .entry(peer_id.clone())
-            .or_insert_with(|| PeerEntry {
-                keys: PeerKeys {
-                    auth_key: SecureKey(vec![]),
-                    transport_key: SecureKey(vec![]),
-                },
-                permissions: HashSet::new(),
-                limiter: PeerLimiterEntry::new(now),
-            });
-        entry.limiter.touch(now);
-        entry.limiter.semaphore.clone()
+            .or_insert_with(|| PeerLimiterEntry::new(now));
+        entry.touch(now);
+        entry.semaphore.clone()
     };
     let _peer_permit = match peer_limiter.try_acquire() {
         Ok(p) => p,
@@ -802,11 +851,11 @@ async fn download_handler(
 
     // ADR-015: Block peers with too many consecutive ticket verification failures.
     if let Some(failures) = state.app.ticket_verify_failures.get(&peer_id) {
-        if *failures >= Config::MAX_TICKET_VERIFY_FAILURES {
+        if failures.count >= Config::MAX_TICKET_VERIFY_FAILURES {
             tracing::warn!(
                 "Peer {} blocked: {} consecutive ticket verify failures",
                 peer_id,
-                *failures
+                failures.count
             );
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -817,13 +866,7 @@ async fn download_handler(
     }
 
     if SecurityManager::verify_ticket(&ticket_str, &peer_ref.value().keys.auth_key).is_err() {
-        // ADR-015: Increment consecutive failure counter
-        state
-            .app
-            .ticket_verify_failures
-            .entry(peer_id.clone())
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
+        record_ticket_verify_failure(&state.app, &peer_id);
         return (StatusCode::FORBIDDEN, "Invalid ticket").into_response();
     }
 
@@ -831,15 +874,13 @@ async fn download_handler(
         Ok(issuer) => issuer.to_string(),
         Err(_) => return (StatusCode::BAD_REQUEST, "Malformed ticket payload").into_response(),
     };
-    if let Err(_) =
-        verify_ticket_with_counter_on_state(&state.app, &ticket_str, &peer_ref.value().keys.auth_key, &issuer_peer_id)
-    {
-        state
-            .app
-            .ticket_verify_failures
-            .entry(peer_id.clone())
-            .and_modify(|c| *c += 1)
-            .or_insert(1);
+    if let Err(_) = verify_ticket_with_counter_on_state(
+        &state.app,
+        &ticket_str,
+        &peer_ref.value().keys.auth_key,
+        &issuer_peer_id,
+    ) {
+        record_ticket_verify_failure(&state.app, &peer_id);
         return (StatusCode::FORBIDDEN, "Invalid ticket").into_response();
     }
 
@@ -994,22 +1035,38 @@ fn verify_ticket_with_counter_on_state(
 ) -> Result<(), AetherError> {
     SecurityManager::verify_ticket(ticket, secret)?;
     if let Some(counter) = SecurityManager::extract_counter(ticket)? {
-        let last_accepted = state
-            .ticket_counters
-            .get(issuer_peer_id)
-            .map(|v| *v)
-            .unwrap_or(0);
-        if counter <= last_accepted {
-            return Err(AetherError::SecurityError(format!(
-                "Ticket counter {} is not greater than last accepted {} (ADR-017)",
-                counter, last_accepted
-            )));
+        match state.ticket_counters.entry(issuer_peer_id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let last_accepted = *entry.get();
+                if counter <= last_accepted {
+                    return Err(AetherError::SecurityError(format!(
+                        "Ticket counter {} is not greater than last accepted {} (ADR-017)",
+                        counter, last_accepted
+                    )));
+                }
+                entry.insert(counter);
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(counter);
+            }
         }
-        state
-            .ticket_counters
-            .insert(issuer_peer_id.to_string(), counter);
     }
     Ok(())
+}
+
+fn record_ticket_verify_failure(state: &AppState, peer_id: &str) {
+    let now = current_unix_secs();
+    state
+        .ticket_verify_failures
+        .entry(peer_id.to_string())
+        .and_modify(|entry| {
+            entry.count = entry.count.saturating_add(1);
+            entry.last_failure_unix_secs = now;
+        })
+        .or_insert(TicketVerifyFailureEntry {
+            count: 1,
+            last_failure_unix_secs: now,
+        });
 }
 
 fn encrypted_file_stream(
@@ -1077,7 +1134,10 @@ fn get_available_ram() -> u64 {
         2 * 1024 * 1024 * 1024
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(
+        not(target_os = "linux"),
+        not(any(target_os = "ios", target_os = "macos"))
+    ))]
     {
         // macOS/iOS: use sysctl hw.memsize as rough total, assume 50% available
         // This is conservative; on iOS the actual free memory is lower but
@@ -1101,6 +1161,53 @@ fn get_available_ram() -> u64 {
         } else {
             // Fallback: assume 2GB
             2 * 1024 * 1024 * 1024
+        }
+    }
+
+    #[cfg(any(target_os = "ios", target_os = "macos"))]
+    {
+        let host = unsafe { libc::mach_host_self() };
+        let mut page_size: libc::vm_size_t = 0;
+        let page_size_result = unsafe { libc::host_page_size(host, &mut page_size) };
+        if page_size_result == libc::KERN_SUCCESS {
+            let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64_data_t>::zeroed();
+            let mut count = libc::HOST_VM_INFO64_COUNT;
+            let stats_result = unsafe {
+                libc::host_statistics64(
+                    host,
+                    libc::HOST_VM_INFO64,
+                    stats.as_mut_ptr() as libc::host_info64_t,
+                    &mut count,
+                )
+            };
+            if stats_result == libc::KERN_SUCCESS {
+                let stats = unsafe { stats.assume_init() };
+                let available_pages = stats
+                    .free_count
+                    .saturating_add(stats.inactive_count)
+                    .saturating_add(stats.speculative_count);
+                return u64::from(available_pages).saturating_mul(u64::from(page_size));
+            }
+        }
+
+        // Fallback: use a more conservative fraction of total RAM when Mach APIs fail.
+        let mut size: libc::size_t = 0;
+        let mut len = std::mem::size_of::<libc::size_t>();
+        let mib = [libc::CTL_HW, libc::HW_MEMSIZE];
+        let result = unsafe {
+            libc::sysctl(
+                mib.as_ptr() as *mut libc::c_int,
+                2,
+                &mut size as *mut _ as *mut libc::c_void,
+                &mut len as *mut _ as *mut libc::c_void,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result == 0 {
+            (size as u64 / 4).max(256 * 1024 * 1024)
+        } else {
+            512 * 1024 * 1024
         }
     }
 }
@@ -1153,6 +1260,48 @@ mod tests {
     }
 
     #[test]
+    fn engine_generates_noise_static_keypair() {
+        let engine = AetherEngine::new();
+        let public = engine.get_noise_static_public_key_for_test();
+        assert_eq!(
+            public.len(),
+            transport_encryption::noise_static_public_key_len()
+        );
+        assert_eq!(
+            engine.noise_static_private_key.read().unwrap().0.len(),
+            transport_encryption::noise_static_public_key_len()
+        );
+    }
+
+    #[test]
+    fn register_peer_noise_static_key_requires_known_peer() {
+        let engine = AetherEngine::new();
+        let result = engine.register_peer_noise_static_key("missing".into(), vec![7u8; 32]);
+        assert!(matches!(result, Err(AetherError::PeerNotFound)));
+    }
+
+    #[test]
+    fn register_peer_key_preserves_noise_static_key() {
+        let engine = AetherEngine::new();
+        engine
+            .register_peer_key("peer-a".into(), vec![0xAAu8; 32])
+            .unwrap();
+        engine
+            .register_peer_noise_static_key("peer-a".into(), vec![0x11u8; 32])
+            .unwrap();
+
+        engine
+            .register_peer_key("peer-a".into(), vec![0xBBu8; 32])
+            .unwrap();
+
+        let peer = engine.state.peers.get("peer-a").unwrap();
+        assert_eq!(
+            peer.keys.noise_remote_static_key.as_deref(),
+            Some([0x11u8; 32].as_slice())
+        );
+    }
+
+    #[test]
     fn hkdf_produces_different_key_than_raw_input() {
         // The derived key must differ from the raw ECDH secret.
         let raw = vec![0xABu8; 32];
@@ -1190,6 +1339,33 @@ mod tests {
         engine.seed_manifest_sequence("model-a".into(), 3).unwrap();
         let stored = engine.state.manifest_sequences.get("model-a").map(|v| *v);
         assert_eq!(stored, Some(5));
+    }
+
+    #[test]
+    fn verify_ticket_with_counter_rejects_reused_counter() {
+        let engine = AetherEngine::new();
+        let raw = vec![0x44u8; 32];
+        let derived = SecurityManager::derive_hmac_key(&raw).unwrap();
+        let secret = SecureKey(derived.to_vec());
+        let ticket =
+            SecurityManager::generate_ticket_with_counter("m", "1", "peer-a", 7, &secret).unwrap();
+
+        engine
+            .verify_ticket_with_counter(&ticket, &secret, "peer-a")
+            .unwrap();
+        let reused = engine.verify_ticket_with_counter(&ticket, &secret, "peer-a");
+        assert!(matches!(reused, Err(AetherError::SecurityError(_))));
+    }
+
+    #[test]
+    fn ticket_verify_failure_entry_tracks_count_and_timestamp() {
+        let engine = AetherEngine::new();
+        record_ticket_verify_failure(&engine.state, "peer-a");
+        record_ticket_verify_failure(&engine.state, "peer-a");
+
+        let failure = engine.state.ticket_verify_failures.get("peer-a").unwrap();
+        assert_eq!(failure.count, 2);
+        assert!(failure.last_failure_unix_secs <= current_unix_secs());
     }
 
     #[test]

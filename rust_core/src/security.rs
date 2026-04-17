@@ -44,7 +44,11 @@ impl SecurityManager {
         } else {
             None
         };
-        let issuer = if fields.len() >= 5 { fields[4] } else { fields[3] };
+        let issuer = if fields.len() >= 5 {
+            fields[4]
+        } else {
+            fields[3]
+        };
         if model_id.is_empty() || version.is_empty() || ts_str.is_empty() || issuer.is_empty() {
             return Err(AetherError::InvalidTicket);
         }

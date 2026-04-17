@@ -370,3 +370,97 @@ final class RustCanonicalJSONTests: XCTestCase {
         XCTAssertEqual(rustResult, #"{"a":"first","m":"mid","z":"last"}"#)
     }
 }
+
+final class ManifestSequenceTests: XCTestCase {
+
+    private final class FakeEngine: ManifestVerificationEngine {
+        var canonicalResult = "{}"
+        var seedCalls: [(String, UInt64)] = []
+        var verifyCalls: [(String, UInt64)] = []
+        var verifyError: Error?
+
+        func canonicalizeJson(json: String) throws -> String { canonicalResult }
+
+        func seedManifestSequence(modelId: String, sequence: UInt64) throws {
+            seedCalls.append((modelId, sequence))
+        }
+
+        func verifyManifestWithSequence(
+            modelId: String,
+            sequence: UInt64,
+            canonicalJson: String,
+            sigHex: String,
+            publicKeyDer: [UInt8]
+        ) throws {
+            if let verifyError {
+                throw verifyError
+            }
+            verifyCalls.append((modelId, sequence))
+        }
+    }
+
+    private final class FakeStore: ManifestSequenceStore {
+        private var values: [String: UInt64]
+
+        init(values: [String: UInt64] = [:]) {
+            self.values = values
+        }
+
+        func getLastAccepted(modelId: String) -> UInt64 {
+            values[modelId] ?? 0
+        }
+
+        func persistAccepted(modelId: String, sequence: UInt64) {
+            values[modelId] = sequence
+        }
+
+        func persisted(_ modelId: String) -> UInt64? {
+            values[modelId]
+        }
+    }
+
+    func test_manifestVerificationSeedsAndPersistsAcceptedSequence() throws {
+        let engine = FakeEngine()
+        engine.canonicalResult = #"{"id":"llm-mini","sequence":7}"#
+        let store = FakeStore(values: ["llm-mini": 6])
+        let manifestJson = #"{"payload":{"id":"llm-mini","sequence":7},"signature":"abcd"}"#
+
+        let parsed = try ManifestVerificationHelper.parseAndVerifyForUpdate(
+            manifestJson: manifestJson,
+            adminPublicKeyDer: Data([1, 2, 3]),
+            engine: engine,
+            sequenceStore: store
+        )
+
+        XCTAssertEqual(parsed.modelId, "llm-mini")
+        XCTAssertEqual(parsed.sequence, 7)
+        XCTAssertEqual(engine.seedCalls.count, 1)
+        XCTAssertEqual(engine.seedCalls.first?.0, "llm-mini")
+        XCTAssertEqual(engine.seedCalls.first?.1, 6)
+        XCTAssertEqual(engine.verifyCalls.count, 1)
+        XCTAssertEqual(engine.verifyCalls.first?.1, 7)
+        XCTAssertEqual(store.persisted("llm-mini"), 7)
+    }
+
+    func test_manifestRollbackDoesNotPersistDowngradedSequence() {
+        let engine = FakeEngine()
+        engine.canonicalResult = #"{"id":"llm-mini","sequence":5}"#
+        engine.verifyError = AetherError.SecurityError(
+            "Manifest sequence 5 is not greater than last accepted 6 (ADR-016)"
+        )
+        let store = FakeStore(values: ["llm-mini": 6])
+        let manifestJson = #"{"payload":{"id":"llm-mini","sequence":5},"signature":"abcd"}"#
+
+        XCTAssertThrowsError(
+            try ManifestVerificationHelper.parseAndVerifyForUpdate(
+                manifestJson: manifestJson,
+                adminPublicKeyDer: Data([1, 2, 3]),
+                engine: engine,
+                sequenceStore: store
+            )
+        )
+        XCTAssertEqual(engine.seedCalls.count, 1)
+        XCTAssertEqual(engine.seedCalls.first?.1, 6)
+        XCTAssertEqual(store.persisted("llm-mini"), 6)
+    }
+}

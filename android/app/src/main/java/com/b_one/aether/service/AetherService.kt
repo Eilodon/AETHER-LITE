@@ -6,7 +6,9 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.os.Build
 import android.os.IBinder
 import android.os.ParcelFileDescriptor
@@ -14,6 +16,8 @@ import android.system.Os
 import android.system.OsConstants
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKeys
 import com.b_one.aether.MainActivity
 import com.b_one.aether.R
 import com.b_one.aether.security.PeerPin
@@ -58,6 +62,10 @@ class AetherService : Service() {
 
     private val scope        = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val rustEngine: AetherEngine by lazy { AetherEngine() }
+    private val manifestVerificationEngine by lazy { RustManifestVerificationEngine(rustEngine) }
+    private val manifestSequenceStore by lazy {
+        EncryptedManifestSequenceStore(applicationContext, MANIFEST_SEQUENCE_PREFS)
+    }
     private val peerPinStore by lazy { PeerPinStore(applicationContext) }
 
     // ADR-010: single source of truth — query from Rust config instead of hardcoding
@@ -242,39 +250,18 @@ class AetherService : Service() {
         return scope.launch {
             try {
                 // ── 1. Verify manifest signature first ────────────────────────
-                val manifest    = JSONObject(manifestJson)
-                val payload     = manifest.getJSONObject("payload")
-                val signatureHex = manifest.getString("signature")
-                val modelId = payload.getString("id")
-                val sequence = if (payload.has("sequence") && !payload.isNull("sequence")) {
-                    payload.getLong("sequence")
-                } else {
-                    throw SecurityException("Manifest sequence missing (ADR-016)")
-                }
-                require(sequence > 0L) { "Manifest sequence must be > 0 (ADR-016)" }
-
-                // Reconstruct canonical JSON (sorted keys, no whitespace)
-                val canonicalJson = rustEngine.canonicalizeJson(payload.toString())
-
-                val prefs = getSharedPreferences(MANIFEST_SEQUENCE_PREFS, MODE_PRIVATE)
-                val lastAccepted = prefs.getLong(modelId, 0L)
-                if (lastAccepted > 0L) {
-                    rustEngine.seedManifestSequence(modelId, lastAccepted.toULong())
-                }
                 try {
-                    rustEngine.verifyManifestWithSequence(
-                        modelId = modelId,
-                        sequence = sequence.toULong(),
-                        canonicalJson = canonicalJson,
-                        sigHex = signatureHex,
-                        publicKeyDer = adminPublicKey
+                    ManifestVerification.parseAndVerifyForUpdate(
+                        manifestJson = manifestJson,
+                        adminPublicKey = adminPublicKey,
+                        engine = manifestVerificationEngine,
+                        sequenceStore = manifestSequenceStore
                     )
                 } catch (e: Exception) {
                     Log.e(TAG, "❌ Manifest verification failed – aborting patch", e)
                     onError?.invoke(e)
                     return@launch
                 }
-                prefs.edit().putLong(modelId, sequence).apply()
                 Log.i(TAG, "✅ Manifest signature + sequence verified in Rust")
 
                 // ── 2. Apply patch via Rust ───────────────────────────────────
@@ -607,5 +594,57 @@ class AetherService : Service() {
         // ADR-011: also revoke in Rust engine so the peer cannot download
         // in the current session (previously only cleared persistent storage).
         try { rustEngine.revokePeer(peerId) } catch (_: Exception) {}
+    }
+}
+
+internal class SharedPreferencesManifestSequenceStore(
+    private val prefs: SharedPreferences,
+) : ManifestSequenceStore {
+    override fun getLastAccepted(modelId: String): Long = prefs.getLong(modelId, 0L)
+
+    override fun persistAccepted(modelId: String, sequence: Long) {
+        prefs.edit().putLong(modelId, sequence).apply()
+    }
+}
+
+internal class EncryptedManifestSequenceStore(
+    context: Context,
+    legacyPrefsName: String,
+) : ManifestSequenceStore {
+    private val prefs: SharedPreferences = EncryptedSharedPreferences.create(
+        "${legacyPrefsName}_encrypted",
+        MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC),
+        context,
+        EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+        EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+    )
+
+    init {
+        migrateFromPlaintext(context, legacyPrefsName)
+    }
+
+    override fun getLastAccepted(modelId: String): Long = prefs.getLong(modelId, 0L)
+
+    override fun persistAccepted(modelId: String, sequence: Long) {
+        prefs.edit().putLong(modelId, sequence).apply()
+    }
+
+    private fun migrateFromPlaintext(context: Context, legacyPrefsName: String) {
+        val oldPrefs = context.getSharedPreferences(legacyPrefsName, Context.MODE_PRIVATE)
+        if (oldPrefs.all.isEmpty()) return
+
+        val editor = prefs.edit()
+        for ((key, value) in oldPrefs.all) {
+            val longValue = when (value) {
+                is Long -> value
+                is Int -> value.toLong()
+                else -> null
+            } ?: continue
+            if (longValue > 0L) {
+                editor.putLong(key, longValue)
+            }
+        }
+        editor.apply()
+        oldPrefs.edit().clear().apply()
     }
 }

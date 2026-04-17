@@ -436,6 +436,11 @@ $ cargo check
   - Defined `NoiseSession` enum and stub functions (`init_noise_responder`, `init_noise_initiator`, etc.)
   - Added module declaration to `lib.rs`
 - **Status:** ROADMAP — Full implementation requires dedicated architectural cycle
+- **Scope lock (Cycle #2):**
+  - C1 in scope: `/identity`, `/download`, ping/heartbeat transport, headers/query params/response metadata
+  - C2 in scope: per-connection ephemeral handshake and separation of Noise static keys from current HMAC/ChaCha20 key material
+  - Preserved: existing ChaCha20 body/session encryption as defense-in-depth
+  - Explicitly out of scope: CDN/manifest distribution, `forge.py`, ECDSA manifest signing, removing ChaCha20 in the same cycle
 - **Planned Implementation:**
   - Noise Protocol NK pattern using `snow` crate
   - Ephemeral key exchange for forward secrecy
@@ -465,3 +470,45 @@ Syntax OK
 | ADR-016 | ✅ COMPLETE | Manifest sequence numbers |
 | ADR-017 | ✅ COMPLETE | Ticket monotonic counter |
 | ADR-018 | ⏸️ ROADMAP | Noise Protocol transport encryption (stub) |
+
+---
+
+## [V] Vision — Cycle #2 — 2026-04-16
+
+### C4 Model
+```
+[Android/iOS Mobile App] ── plaintext TCP/HTTP today ──► [Rust Core P2P Node]
+        │                                                    │
+        ├── AetherService / AetherManager                    ├── Axum handlers: /identity, /download
+        ├── UniFFI bindings                                  ├── network.rs client download path
+        ├── Vault / SecureVault                              ├── SecurityManager (HMAC, ECDSA, HKDF)
+        └── PeerTrust / local stores                         └── transport_encryption.rs (ADR-018 scope contract)
+
+[CDN + forge.py manifest flow] ── separate trust path ──► [Mobile update verification]
+```
+
+### Bounded Contexts
+| Context | Owner | Depends On | Consumers | Notes |
+|---|---|---|---|---|
+| P2P Transport | Rust | `lib.rs`, `network.rs`, `security.rs` | Android, iOS | C1 primary blast radius |
+| Transport Handshake | Rust | `transport_encryption.rs`, future `snow` | P2P Transport | C2 primary blast radius |
+| Mobile FFI | Kotlin/Swift | UniFFI bindings, Rust API | Mobile service/manager | Must avoid broad API churn in first transport cycle |
+| Manifest/CDN Path | Python + Mobile | `forge.py`, manifest verify helpers | Update flow | Explicitly out of ADR-018 cycle scope |
+
+### Resource Budget
+| Resource | Budget | Unit | Alert Threshold | Notes |
+|---|---|---|---|---|
+| Time | 1 architecture cycle | cycle | 80% scope drift | Scope-lock only; no full Noise rollout yet |
+| Blast radius | Rust core transport + mobile wrappers | subsystems | Any spread into CDN/manifest path | Keep write-set narrow |
+| Compatibility debt | Temporary plaintext fallback | migration phase | Must not survive final enforce phase | Allowed only during transition |
+| Team bandwidth | UNCONSTRAINED | eng-hours/sprint | 80% | Conservative default until dedicated cycle starts |
+
+### Alert Thresholds
+- Warning: any ADR-018 task that modifies `forge.py`, manifest signature flow, or CDN update protocol without an explicit follow-on ADR.
+- Hard stop: any proposal that reuses existing static HMAC/transport keys as Noise static keys.
+- Rollback trigger: if migration design requires permanent plaintext fallback rather than gated transition-only fallback.
+
+### Flags
+- Architecture type: P2P mobile app with Rust core and mobile wrappers
+- Known high-coupling areas: Rust transport handlers, UniFFI boundary, mobile networking callers
+- Areas explicitly OUT of scope this cycle: CDN/manifest transport, key rotation, device integrity, removal of ChaCha20 defense-in-depth

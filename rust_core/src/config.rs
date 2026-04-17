@@ -59,6 +59,10 @@ impl Config {
     /// Prevents HMAC computation abuse via repeated invalid tickets.
     pub const MAX_TICKET_VERIFY_FAILURES: u32 = 5;
 
+    /// TTL for consecutive ticket verification failures.
+    /// Prevents transient onboarding/key-rotation issues from blocking a peer forever.
+    pub const MAX_TICKET_VERIFY_FAILURE_TTL_SECS: u64 = 30 * 60;
+
     /// Obfuscated auth header name.
     #[inline(always)]
     pub fn get_header_key() -> &'static str {

@@ -414,6 +414,7 @@ class TestPublishRealRun:
             "--new",  str(model),
             "--id",   "llm-mini",
             "--ver",  "3.0",
+            "--seq",  "1",
             "--key",  str(key_dir / "admin_private.pem"),
             "--out",  str(dist),
             "--compress-level", "1",   # fast for tests
@@ -430,6 +431,7 @@ class TestPublishRealRun:
         assert data["signature"] is not None, "Real publish must have a signature"
         assert data["payload"]["id"] == "llm-mini"
         assert data["payload"]["version"] == "3.0"
+        assert data["payload"]["sequence"] == 1
 
         # Verify the written manifest passes `forge verify`
         verify_result = runner.invoke(f.cli, [
@@ -454,3 +456,33 @@ class TestPublishRealRun:
             # no --key, no --dry-run
         ])
         assert result.exit_code != 0, "Must fail without --key when not dry-run"
+
+    def test_publish_requires_seq_without_dry_run(self, tmp_path, key_pair):
+        """ADR-016: real publish must provide --seq."""
+        from click.testing import CliRunner
+        from cryptography.hazmat.primitives import serialization
+
+        runner = CliRunner()
+        priv_key, _ = key_pair
+        key_dir = tmp_path / "keys"
+        key_dir.mkdir()
+        (key_dir / "admin_private.pem").write_bytes(
+            priv_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        )
+
+        model = tmp_path / "model.bin"
+        model.write_bytes(b"data")
+        result = runner.invoke(f.cli, [
+            "publish",
+            "--new", str(model),
+            "--id", "m",
+            "--ver", "1.0",
+            "--key", str(key_dir / "admin_private.pem"),
+            "--out", str(tmp_path / "dist"),
+        ])
+        assert result.exit_code != 0, "Must fail without --seq when not dry-run"
+        assert "--seq is required" in result.output
