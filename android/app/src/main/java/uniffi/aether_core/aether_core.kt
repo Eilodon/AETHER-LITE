@@ -400,9 +400,15 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_aether_core_fn_method_aetherengine_check_patch_ram_feasibility(`ptr`: Pointer,`oldFileSize`: Long,`patchFileSize`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_aether_core_fn_method_aetherengine_complete_noise_handshake(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_decompress_file(`ptr`: Pointer,`compressedFd`: Int,`outputFd`: Int,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     fun uniffi_aether_core_fn_method_aetherengine_download_model(`ptr`: Pointer,`peerIp`: RustBuffer.ByValue,`peerPort`: Short,`seederPeerId`: RustBuffer.ByValue,`ticket`: RustBuffer.ByValue,`expectedSha256`: RustBuffer.ByValue,`resumeFrom`: Long,`fd`: Int,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_aether_core_fn_method_aetherengine_enable_noise_transport(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_aether_core_fn_method_aetherengine_establish_noise_session(`ptr`: Pointer,`peerIp`: RustBuffer.ByValue,`peerPort`: Short,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_get_protocol_version(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -410,13 +416,19 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_heartbeat(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_aether_core_fn_method_aetherengine_initiate_noise_handshake(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_aether_core_fn_method_aetherengine_is_server_running(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
     fun uniffi_aether_core_fn_method_aetherengine_ping_peer(`ptr`: Pointer,`peerIp`: RustBuffer.ByValue,`peerPort`: Short,uniffi_out_err: UniffiRustCallStatus, 
     ): Byte
+    fun uniffi_aether_core_fn_method_aetherengine_ping_peer_secure(`ptr`: Pointer,`peerIp`: RustBuffer.ByValue,`peerPort`: Short,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Byte
     fun uniffi_aether_core_fn_method_aetherengine_register_file_for_serving(`ptr`: Pointer,`modelId`: RustBuffer.ByValue,`filePath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_register_peer_key(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`sharedSecret`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_aether_core_fn_method_aetherengine_register_peer_noise_static_key(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,`publicKey`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_aether_core_fn_method_aetherengine_revoke_peer(`ptr`: Pointer,`peerId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -554,9 +566,15 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_check_patch_ram_feasibility(
     ): Short
+    fun uniffi_aether_core_checksum_method_aetherengine_complete_noise_handshake(
+    ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_decompress_file(
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_download_model(
+    ): Short
+    fun uniffi_aether_core_checksum_method_aetherengine_enable_noise_transport(
+    ): Short
+    fun uniffi_aether_core_checksum_method_aetherengine_establish_noise_session(
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_get_protocol_version(
     ): Short
@@ -564,13 +582,19 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_heartbeat(
     ): Short
+    fun uniffi_aether_core_checksum_method_aetherengine_initiate_noise_handshake(
+    ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_is_server_running(
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_ping_peer(
     ): Short
+    fun uniffi_aether_core_checksum_method_aetherengine_ping_peer_secure(
+    ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_register_file_for_serving(
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_register_peer_key(
+    ): Short
+    fun uniffi_aether_core_checksum_method_aetherengine_register_peer_noise_static_key(
     ): Short
     fun uniffi_aether_core_checksum_method_aetherengine_revoke_peer(
     ): Short
@@ -618,10 +642,19 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_aether_core_checksum_method_aetherengine_check_patch_ram_feasibility() != 8094.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_aether_core_checksum_method_aetherengine_complete_noise_handshake() != 19119.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_decompress_file() != 54578.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_download_model() != 6455.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_aether_core_checksum_method_aetherengine_enable_noise_transport() != 21247.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_aether_core_checksum_method_aetherengine_establish_noise_session() != 17392.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_get_protocol_version() != 25857.toShort()) {
@@ -633,16 +666,25 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_aether_core_checksum_method_aetherengine_heartbeat() != 16336.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_aether_core_checksum_method_aetherengine_initiate_noise_handshake() != 2253.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_is_server_running() != 65215.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_ping_peer() != 46158.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_aether_core_checksum_method_aetherengine_ping_peer_secure() != 57420.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_register_file_for_serving() != 63267.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_register_peer_key() != 14813.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_aether_core_checksum_method_aetherengine_register_peer_noise_static_key() != 19375.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_aether_core_checksum_method_aetherengine_revoke_peer() != 12497.toShort()) {
@@ -672,7 +714,7 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_aether_core_checksum_method_aetherengine_verify_manifest_with_sequence() != 30926.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_aether_core_checksum_constructor_aetherengine_new() != 5416.toShort()) {
+    if (lib.uniffi_aether_core_checksum_constructor_aetherengine_new() != 38761.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1102,9 +1144,15 @@ public interface AetherEngineInterface {
     
     fun `checkPatchRamFeasibility`(`oldFileSize`: ULong, `patchFileSize`: ULong)
     
+    fun `completeNoiseHandshake`(`peerId`: String, `response`: ByteArray)
+    
     fun `decompressFile`(`compressedFd`: Int, `outputFd`: Int): ULong
     
     fun `downloadModel`(`peerIp`: String, `peerPort`: UShort, `seederPeerId`: String, `ticket`: String, `expectedSha256`: String, `resumeFrom`: ULong, `fd`: Int)
+    
+    fun `enableNoiseTransport`()
+    
+    fun `establishNoiseSession`(`peerIp`: String, `peerPort`: UShort, `peerId`: String)
     
     fun `getProtocolVersion`(): String
     
@@ -1112,13 +1160,19 @@ public interface AetherEngineInterface {
     
     fun `heartbeat`()
     
+    fun `initiateNoiseHandshake`(`peerId`: String): ByteArray
+    
     fun `isServerRunning`(): Boolean
     
     fun `pingPeer`(`peerIp`: String, `peerPort`: UShort): Boolean
     
+    fun `pingPeerSecure`(`peerIp`: String, `peerPort`: UShort, `peerId`: String): Boolean
+    
     fun `registerFileForServing`(`modelId`: String, `filePath`: String)
     
     fun `registerPeerKey`(`peerId`: String, `sharedSecret`: ByteArray)
+    
+    fun `registerPeerNoiseStaticKey`(`peerId`: String, `publicKey`: ByteArray)
     
     fun `revokePeer`(`peerId`: String)
     
@@ -1156,7 +1210,7 @@ open class AetherEngine : FFIObject, AetherEngineInterface {
     constructor(noPointer: NoPointer): super(noPointer)
     constructor() :
         this(
-    uniffiRustCall() { _status ->
+    uniffiRustCallWithError(AetherException) { _status ->
     UniffiLib.INSTANCE.uniffi_aether_core_fn_constructor_aetherengine_new(_status)
 })
 
@@ -1215,6 +1269,17 @@ open class AetherEngine : FFIObject, AetherEngineInterface {
     
     
     
+    @Throws(AetherException::class)override fun `completeNoiseHandshake`(`peerId`: String, `response`: ByteArray) =
+        callWithPointer {
+    uniffiRustCallWithError(AetherException) { _status ->
+    UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_complete_noise_handshake(it,
+        FfiConverterString.lower(`peerId`),FfiConverterByteArray.lower(`response`),
+        _status)
+}
+        }
+    
+    
+    
     @Throws(AetherException::class)override fun `decompressFile`(`compressedFd`: Int, `outputFd`: Int): ULong =
         callWithPointer {
     uniffiRustCallWithError(AetherException) { _status ->
@@ -1232,6 +1297,27 @@ open class AetherEngine : FFIObject, AetherEngineInterface {
     uniffiRustCallWithError(AetherException) { _status ->
     UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_download_model(it,
         FfiConverterString.lower(`peerIp`),FfiConverterUShort.lower(`peerPort`),FfiConverterString.lower(`seederPeerId`),FfiConverterString.lower(`ticket`),FfiConverterString.lower(`expectedSha256`),FfiConverterULong.lower(`resumeFrom`),FfiConverterInt.lower(`fd`),
+        _status)
+}
+        }
+    
+    
+    override fun `enableNoiseTransport`() =
+        callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_enable_noise_transport(it,
+        
+        _status)
+}
+        }
+    
+    
+    
+    @Throws(AetherException::class)override fun `establishNoiseSession`(`peerIp`: String, `peerPort`: UShort, `peerId`: String) =
+        callWithPointer {
+    uniffiRustCallWithError(AetherException) { _status ->
+    UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_establish_noise_session(it,
+        FfiConverterString.lower(`peerIp`),FfiConverterUShort.lower(`peerPort`),FfiConverterString.lower(`peerId`),
         _status)
 }
         }
@@ -1270,6 +1356,18 @@ open class AetherEngine : FFIObject, AetherEngineInterface {
         }
     
     
+    
+    @Throws(AetherException::class)override fun `initiateNoiseHandshake`(`peerId`: String): ByteArray =
+        callWithPointer {
+    uniffiRustCallWithError(AetherException) { _status ->
+    UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_initiate_noise_handshake(it,
+        FfiConverterString.lower(`peerId`),
+        _status)
+}
+        }.let {
+            FfiConverterByteArray.lift(it)
+        }
+    
     override fun `isServerRunning`(): Boolean =
         callWithPointer {
     uniffiRustCall() { _status ->
@@ -1294,6 +1392,18 @@ open class AetherEngine : FFIObject, AetherEngineInterface {
         }
     
     
+    @Throws(AetherException::class)override fun `pingPeerSecure`(`peerIp`: String, `peerPort`: UShort, `peerId`: String): Boolean =
+        callWithPointer {
+    uniffiRustCallWithError(AetherException) { _status ->
+    UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_ping_peer_secure(it,
+        FfiConverterString.lower(`peerIp`),FfiConverterUShort.lower(`peerPort`),FfiConverterString.lower(`peerId`),
+        _status)
+}
+        }.let {
+            FfiConverterBoolean.lift(it)
+        }
+    
+    
     @Throws(AetherException::class)override fun `registerFileForServing`(`modelId`: String, `filePath`: String) =
         callWithPointer {
     uniffiRustCallWithError(AetherException) { _status ->
@@ -1310,6 +1420,17 @@ open class AetherEngine : FFIObject, AetherEngineInterface {
     uniffiRustCallWithError(AetherException) { _status ->
     UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_register_peer_key(it,
         FfiConverterString.lower(`peerId`),FfiConverterByteArray.lower(`sharedSecret`),
+        _status)
+}
+        }
+    
+    
+    
+    @Throws(AetherException::class)override fun `registerPeerNoiseStaticKey`(`peerId`: String, `publicKey`: ByteArray) =
+        callWithPointer {
+    uniffiRustCallWithError(AetherException) { _status ->
+    UniffiLib.INSTANCE.uniffi_aether_core_fn_method_aetherengine_register_peer_noise_static_key(it,
+        FfiConverterString.lower(`peerId`),FfiConverterByteArray.lower(`publicKey`),
         _status)
 }
         }

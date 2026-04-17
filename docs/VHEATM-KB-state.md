@@ -512,3 +512,248 @@ Syntax OK
 - Architecture type: P2P mobile app with Rust core and mobile wrappers
 - Known high-coupling areas: Rust transport handlers, UniFFI boundary, mobile networking callers
 - Areas explicitly OUT of scope this cycle: CDN/manifest transport, key rotation, device integrity, removal of ChaCha20 defense-in-depth
+
+---
+
+## [V] Vision — Cycle #3 — 2026-04-17
+
+### C4 Model
+```
+[Android App / iOS App] ──► [Aether LITE SDK] ──► [LAN peer / local seeder]
+                                    │
+                                    ├──► [Local FS]
+                                    ├──► [TEE / Secure Enclave identity key]
+                                    └──► [CDN + forge.py manifest workflow]
+
+[Rust Core]
+- Axum endpoints: `/identity`, `/noise-handshake`, `/download`, `/ping`
+- `noise_sessions` cache + peer registry
+- `network.rs` HTTP + Noise framing
+- `security.rs` HMAC/HKDF/ECDSA
+```
+
+### Bounded Contexts
+| Context | Owner | Depends On | Consumers | Notes |
+|---|---|---|---|---|
+| Transport control plane | Rust + mobile wrappers | Axum, UniFFI, peer registry | Android, iOS | `/identity`, `/noise-handshake`, `/ping` |
+| Transport data plane | Rust | `network.rs`, `transport_encryption.rs` | Android, iOS | Noise framed body or ChaCha20 fallback |
+| Mobile trust bootstrap | Android/iOS | `PeerTrust`, Vault/SecureVault, Rust FFI | Embedding app | Plaintext `/identity` still intentional |
+| CI / release guardrail | GitHub Actions + docs | repo paths, schemes, README claims | Maintainers | Drift detected this cycle |
+
+### Resource Budget
+| Resource | Budget | Unit | Alert Threshold | Notes |
+|---|---|---|---|---|
+| Financial | UNCONSTRAINED | USD/cycle | 80% | Conservative defaults |
+| Time | 1 audit cycle | cycle | hard stop end-of-cycle | Audit only, no transform |
+| Compute | Local dev machine | CPU/RAM | Rust + Android verification must pass | Verified this cycle |
+| Team bandwidth | 1 engineer | cycle | medium | Working tree not clean |
+
+### Alert Thresholds
+- Warning: any silent divergence between authorization graph and session graph
+- Hard stop: any CI/docs claim that does not match checked-in repo layout
+- Rollback trigger: N/A for audit-only cycle
+
+### Flags
+- Architecture type: mobile SDK + Rust core + admin tooling
+- Known high-coupling areas: Rust↔mobile FFI, transport/session lifecycle, CI↔repo path assumptions
+- Out of scope: deployment infra, UI/camera discovery, CDN runtime
+
+## [G] Diagnose — Cycle #3
+
+### Root Cause Taxonomy Scan
+
+**Layer 1 — Connection Lifecycle:** RELEVANT  
+Hypothesis: Noise session lifecycle is only partially integrated; revocation and server teardown leave stale transport state alive longer than intended.  
+Evidence so far: `noise_sessions` has TTL eviction, but no explicit teardown on `revoke_peer()` or `stop_server()`.
+
+**Layer 2 — Serialization Boundary:** RELEVANT  
+Hypothesis: FFI boundary is healthy on current HEAD, but CI/docs serialization of project reality is stale.  
+Evidence so far: Kotlin binding compiles, while CI references `ios/AetherLite` and README claims 84 tests.
+
+**Layer 3 — Async/Sync Boundary:** RELEVANT  
+Hypothesis: Runtime transport framing is currently correct, but the main residual risk has moved to lifecycle edges rather than async framing logic.  
+Evidence so far: local Rust tests cover secure ping + Noise download and pass.
+
+**Layer 4 — Type Contract:** RELEVANT  
+Hypothesis: Secure ping currently binds to session presence rather than the live peer authorization graph.  
+Evidence so far: `/ping` checks cached session path; no explicit `peers.contains_key(peer_id)` requirement in that branch.
+
+**Layer 5 — Graph/State Lifecycle:** RELEVANT  
+Hypothesis: Authorization graph (`peers`) and session graph (`noise_sessions`) can diverge after revoke/stop.  
+Evidence so far: `revoke_peer()` removes only `peers`; `stop_server()` cancels server tasks and clears `bound_port` only.
+
+**Layer 6 — Error Propagation:** RELEVANT  
+Hypothesis: Release failures in iOS CI remain silent until pipeline execution because local verification in this cycle covered only Rust + Android.  
+Evidence so far: `ci.yml` path/scheme do not match actual `ios/` layout.
+
+### Hypothesis Table
+| ID | Root Cause Summary | Components Affected | Blast Radius | Verify Priority |
+|---|---|---|---|---|
+| H-31 | `noise_sessions` not invalidated on revoke / stop | Rust core, Android, iOS, peer auth model | 🔴 HIGH | Immediate |
+| H-32 | CI/docs drift from repo reality | CI, docs, release confidence | 🟠 MEDIUM | Immediate |
+| H-33 | Noise runtime path may still be under-verified | Rust transport, mobile integrations | 🟠 MEDIUM | After H-31/H-32 |
+
+### Complexity Gate Result
+Scores: [coupling=4, state=4, async=4, silence=4, time=3] = 19/5 = 3.8
+avg = 3.8 → **Debate triggered**
+
+### Debate Result
+**Proposer**
+- H-31: Session invalidation gap is the highest-risk remaining issue because it is silent and security-adjacent. Confidence 92%.
+- H-32: CI/docs drift is high-value and cheap to verify. Confidence 95%.
+- H-33: Runtime Noise path should be validated, but current test suite likely already covers the main happy path. Confidence 80%.
+
+**Critic**
+- H-31: APPROVED — transport and authorization state must not diverge.
+- H-32: APPROVED — operationally critical and cheap.
+- H-33: APPROVED — lower priority than H-31/H-32.
+
+**Synthesizer**
+- Final queue: H-31 → H-32 → H-33
+
+### Final Hypothesis Queue (→ [E])
+| ID | Hypothesis | Blast Radius | Sim Type | Est. Cost |
+|---|---|---|---|---|
+| H-31 | Session cache invalidation is incomplete after revoke / stop | 🔴 HIGH | micro_sim_small | $0.01 |
+| H-32 | CI/docs drift from repo reality | 🟠 MEDIUM | micro_sim_small | $0.01 |
+| H-33 | Noise runtime integration regressed or is under-verified | 🟠 MEDIUM | micro_sim_small | $0.01 |
+
+## [E] Verify — Cycle #3
+
+### FinOps Filter Decision
+KB datapoints: existing cycles present → Mode: PARALLEL
+Filter threshold: 0.3
+
+| H-ID | Sim Type | Est. Cost | ROI | Decision |
+|---|---|---|---|---|
+| H-31 | micro_sim_small | $0.01 | >10 | ADMIT |
+| H-32 | micro_sim_small | $0.01 | >10 | ADMIT |
+| H-33 | micro_sim_small | $0.01 | >10 | ADMIT |
+
+### Simulation: H-31 — Session Cache Invalidation
+**Type:** micro_sim_small  
+**Blast radius:** HIGH
+
+**Setup:** Trace `noise_sessions` creation/use/cleanup in `lib.rs`.
+
+**Reproduce:**  
+- `noise_handshake_handler()` inserts `noise_sessions[peer_id]`  
+- `establish_noise_session_on_state()` inserts and reuses initiator-side session cache  
+- `revoke_peer()` removes only `peers`  
+- `stop_server()` cancels server tasks but does not clear session cache
+
+**Execute:** Static code trace across [lib.rs](/home/ybao/B.1/Aether%20LITE/rust_core/src/lib.rs:378), [lib.rs](/home/ybao/B.1/Aether%20LITE/rust_core/src/lib.rs:389), [lib.rs](/home/ybao/B.1/Aether%20LITE/rust_core/src/lib.rs:585), [lib.rs](/home/ybao/B.1/Aether%20LITE/rust_core/src/lib.rs:1349).
+
+**Assert:**  
+- `noise_sessions` are evicted only by TTL  
+- `/download` still checks `peers`, so stale session does not directly bypass file authorization  
+- `/ping` encrypted path is session-driven, so stale session semantics remain observable after peer teardown unless cache is explicitly cleared
+
+**Verdict:** ✅ CONFIRMED  
+**Evidence:** `revoke_peer()` at `lib.rs:585-590` and `stop_server()` at `lib.rs:389-395` do not clear `noise_sessions`; `ping_handler()` serves encrypted body from session path.  
+**Implication for [A]:** Add explicit session invalidation on revoke and server stop, and bind secure ping to live peer authorization.
+
+### Simulation: H-32 — CI / Docs Drift
+**Type:** micro_sim_small  
+**Blast radius:** MEDIUM
+
+**Setup:** Compare repo structure and local verification output against `ci.yml` and README.
+
+**Reproduce:**  
+- `find ios -maxdepth 2 -type d` shows `ios/AetherApp`, not `ios/AetherLite`  
+- `ios/AetherAppTests/AetherTests.swift` uses `AetherApp` scheme/app name  
+- `README.md` still claims “Expected: 84 tests passed”  
+- Local `cargo test -q` currently runs 69 + 37 Rust tests on HEAD
+
+**Execute:** Repo inspection + local command checks.
+
+**Assert:**  
+- `ci.yml:237-240` is inconsistent with checked-in iOS path/scheme  
+- README test-count claim is stale
+
+**Verdict:** ✅ CONFIRMED  
+**Evidence:** [ci.yml](/home/ybao/B.1/Aether%20LITE/ci.yml:237), [AetherTests.swift](/home/ybao/B.1/Aether%20LITE/ios/AetherAppTests/AetherTests.swift:7), [README.md](/home/ybao/B.1/Aether%20LITE/README.md:81).  
+**Implication for [A]:** Release guardrails need correction before trusting CI/docs coverage statements.
+
+### Simulation: H-33 — Noise Runtime Integration
+**Type:** micro_sim_small  
+**Blast radius:** MEDIUM
+
+**Setup:** Use local verification on current working tree.
+
+**Reproduce:**  
+- `cargo test -q` passes on current HEAD  
+- tests cover secure ping and Noise-backed download path  
+- `./gradlew :app:compileDebugKotlin` passes with regenerated UniFFI bindings
+
+**Execute:** Local command checks on 2026-04-17.
+
+**Assert:**  
+- Rust runtime path is currently healthy for the implemented happy path  
+- Android FFI surface is synchronized with Rust Noise API additions  
+- Remaining risk has moved from “feature unreachable” to lifecycle/release hygiene
+
+**Verdict:** ✅ CONFIRMED (healthy path)  
+**Evidence:** local `cargo test -q` and Android compile succeeded in this cycle.  
+**Implication for [A]:** no new transport rewrite ADR required this cycle.
+
+### Summary for [A]
+Confirmed:
+- H-31 stale session invalidation semantics
+- H-32 CI/docs drift
+- H-33 current runtime path healthy on local verification
+
+Rejected:
+- None
+
+Deferred:
+- Full metadata confidentiality / HTTP-over-Noise redesign
+
+### Cost Record
+| Operation | Estimated | Actual | Delta |
+|---|---|---|---|
+| H-31 code trace | $0.01 | $0.01 | 0 |
+| H-32 repo/CI trace | $0.01 | $0.01 | 0 |
+| H-33 local verify | $0.01 | $0.01 | 0 |
+
+## [A] Decide — Cycle #3
+
+### ADR-019 | 🔴 MANDATORY — Invalidate Noise Sessions on Authorization Teardown
+**Problem:** `noise_sessions` survive `revoke_peer()` and `stop_server()`, allowing stale session state to outlive the authorization graph and server lifecycle.  
+**Decision:** `revoke_peer()` must remove cached Noise session for that peer, and `stop_server()` must clear server-side session cache for the current engine instance.  
+**Evidence:** E-H-31 confirmed stale session lifecycle on current HEAD.  
+**Pattern:**
+```rust
+self.state.peers.remove(&peer_id);
+self.state.noise_sessions.remove(&peer_id);
+
+self.state.shutdown_token.read()?.cancel();
+self.state.noise_sessions.clear();
+```
+**Rejected Alternatives:** TTL-only eviction, documenting current behavior as acceptable, relying only on `/download` peer checks.  
+**Initial weight:** 1.0 | **λ:** 0.20 | **Energy Tax priority:** 0.95
+
+### ADR-020 | 🟠 REQUIRED — Bind Secure Ping to Live Peer Authorization
+**Problem:** secure `/ping` is session-driven and does not explicitly require the peer to remain present in the live authorization graph.  
+**Decision:** secure ping must require both a valid cached session and `peers.contains_key(peer_id)`.  
+**Evidence:** E-H-31 code trace through `ping_handler()` and peer/session cleanup paths.  
+**Pattern:**
+```rust
+if !state.app.peers.contains_key(&peer_id) {
+    return (StatusCode::FORBIDDEN, "Unknown peer identity").into_response();
+}
+```
+**Rejected Alternatives:** leave ping unauthenticated, accept stale session semantics, rely solely on cache invalidation.  
+**Initial weight:** 1.0 | **λ:** 0.20 | **Energy Tax priority:** 0.83
+
+### ADR-021 | 🟠 REQUIRED — Correct CI / Docs to Match Repo Reality
+**Problem:** repository metadata claims coverage that checked-in CI configuration cannot currently execute for iOS, and README test counts are stale.  
+**Decision:** update `ci.yml` to use `ios/AetherApp` and scheme `AetherApp`, and refresh README/security-audit references to current test counts and transport status.  
+**Evidence:** E-H-32 confirmed repo/CI/docs mismatch.  
+**Pattern:**
+```yaml
+working-directory: ios/AetherApp
+xcodebuild test -scheme AetherApp ...
+```
+**Rejected Alternatives:** leave drift in place, treat CI as illustrative only, defer until release.  
+**Initial weight:** 1.0 | **λ:** 0.20 | **Energy Tax priority:** 0.81

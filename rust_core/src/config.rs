@@ -34,6 +34,9 @@ impl Config {
     /// Idle TTL for per-peer limiter entries before background cleanup.
     pub const PEER_LIMITER_IDLE_TTL_SECS: u64 = 15 * 60;
 
+    /// Idle TTL for cached Noise sessions before background cleanup.
+    pub const NOISE_SESSION_IDLE_TTL_SECS: u64 = 15 * 60;
+
     /// Background cleanup cadence for in-memory eviction tasks.
     pub const BACKGROUND_CLEANUP_INTERVAL_SECS: u64 = 30;
 

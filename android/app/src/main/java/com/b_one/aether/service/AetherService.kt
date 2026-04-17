@@ -62,8 +62,8 @@ class AetherService : Service() {
 
     private val scope        = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val rustEngine: AetherEngine by lazy {
-        // ADR-001: constructor now throws AetherError — catch and rethrow as IllegalStateException
-        try { AetherEngine() } catch (e: uniffi.aether_core.AetherError) {
+        // ADR-001: constructor now throws AetherException — catch and rethrow as IllegalStateException
+        try { AetherEngine() } catch (e: uniffi.aether_core.AetherException) {
             throw IllegalStateException("AetherEngine init failed", e)
         }
     }
@@ -509,10 +509,12 @@ class AetherService : Service() {
                     val doc = JSONObject(reader.readText())
                     val peerId = doc.getString("peer_id")
                     val publicKeyHex = doc.getString("public_key_hex")
+                    val noiseStaticKeyHex = doc.optString("noise_static_public_key_hex", "")
                     val peerProtocolVersion = doc.optString("protocol_version", "")
                     // ADR-010: centralized validation in Rust — rejects blank or incompatible version
                     rustEngine.validatePeerProtocol(peerProtocolVersion)
                     require(publicKeyHex.isNotBlank()) { "Peer did not publish an identity key" }
+                    require(noiseStaticKeyHex.isNotBlank()) { "Peer did not publish a Noise static key" }
 
                     if (expectedPeerId != null) {
                         require(peerId == expectedPeerId) { "Peer ID mismatch" }
@@ -548,6 +550,15 @@ class AetherService : Service() {
 
                     val sharedSecret = SecureVault.performHandshake(publicKeyBytes)
                     rustEngine.registerPeerKey(peerId = peerId, sharedSecret = sharedSecret)
+                    rustEngine.registerPeerNoiseStaticKey(
+                        peerId = peerId,
+                        publicKey = PeerTrust.hexToBytes(noiseStaticKeyHex)
+                    )
+                    rustEngine.establishNoiseSession(
+                        peerIp = peerIp,
+                        peerPort = peerPort.toUShort(),
+                        peerId = peerId
+                    )
                     peerPinStore.save(trustDecision.pin)
                     Log.i(TAG, "✅ Authenticated handshake complete with $peerId")
                     onSuccess?.invoke(peerId, fingerprint, trustDecision.trustEstablishedNow)

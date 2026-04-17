@@ -78,7 +78,7 @@ cd rust_core
 cargo test
 ```
 
-Expected: **84 tests passed** (47 unit + 37 integration).
+Expected: **106 tests passed** (69 unit + 37 integration).
 
 ### 2. Install cross-compilation targets
 

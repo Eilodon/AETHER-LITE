@@ -23,7 +23,7 @@ pub mod transport_encryption; // ADR-018: Noise Protocol stub (roadmap)
 use crate::canonical_json::canonicalize_json;
 use crate::config::Config;
 use crate::error::AetherError;
-use crate::network::{download_file_to_fd, ping_peer};
+use crate::network::{download_file_to_fd, ping_peer, ping_peer_secure};
 use crate::security::{SecureKey, SecurityManager};
 use async_stream::try_stream;
 use serde::Serialize;
@@ -33,7 +33,7 @@ use axum::{
     extract::{Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
@@ -49,7 +49,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::runtime::Runtime;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
@@ -85,6 +85,10 @@ struct AppState {
     /// ADR-017: Last accepted ticket counter per issuer peer_id.
     /// Rejects tickets with counter <= stored value (NTP manipulation resistance).
     ticket_counters: DashMap<String, u64>,
+    /// ADR-027: Established Noise transport session per peer.
+    /// Stored separately from peer metadata so session state can be rotated
+    /// without mutating the peer registry entry.
+    noise_sessions: DashMap<String, NoiseSessionEntry>,
 }
 
 /// ADR-012: All per-peer state in a single struct stored under one DashMap key.
@@ -112,6 +116,11 @@ struct TicketVerifyFailureEntry {
     last_failure_unix_secs: u64,
 }
 
+struct NoiseSessionEntry {
+    session: Arc<Mutex<transport_encryption::NoiseSession>>,
+    last_used_unix_secs: AtomicU64,
+}
+
 impl PeerLimiterEntry {
     fn new(now: u64) -> Self {
         Self {
@@ -131,10 +140,29 @@ impl PeerLimiterEntry {
     }
 }
 
+impl NoiseSessionEntry {
+    fn new(session: transport_encryption::NoiseSession, now: u64) -> Self {
+        Self {
+            session: Arc::new(Mutex::new(session)),
+            last_used_unix_secs: AtomicU64::new(now),
+        }
+    }
+
+    fn touch(&self, now: u64) {
+        self.last_used_unix_secs.store(now, Ordering::Relaxed);
+    }
+
+    fn is_idle_expired(&self, now: u64) -> bool {
+        let last_seen = self.last_used_unix_secs.load(Ordering::Relaxed);
+        now.saturating_sub(last_seen) > Config::NOISE_SESSION_IDLE_TTL_SECS
+    }
+}
+
 #[derive(Clone, Serialize)]
 struct IdentityState {
     peer_id: String,
     public_key_hex: String,
+    noise_static_public_key_hex: String,
     protocol_version: String,
 }
 
@@ -142,6 +170,7 @@ struct IdentityState {
 struct ServerState {
     app: Arc<AppState>,
     identity: Arc<IdentityState>,
+    noise_static_private_key: Arc<RwLock<SecureKey>>,
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -154,6 +183,9 @@ pub struct AetherEngine {
     /// Fix v2.3: node's own UUID; sent as `?pid=` in outbound requests.
     self_peer_id: Arc<RwLock<String>>,
     self_public_key_x962: Arc<RwLock<Vec<u8>>>,
+    /// ADR-020: Responder static key persists for the lifetime of the engine.
+    /// Reusing it across `stop_server()` / `start_server()` is intentional so
+    /// existing peer registrations do not lose the seeder's advertised key.
     #[allow(dead_code)]
     noise_static_private_key: Arc<RwLock<SecureKey>>,
     noise_static_public_key: Arc<RwLock<Vec<u8>>>,
@@ -183,6 +215,10 @@ impl AetherEngine {
         // ADR-001: propagate error instead of expect()/panic
         let noise_static = transport_encryption::generate_static_keypair()
             .map_err(|e| AetherError::InternalError(format!("Noise static key init failed: {}", e)))?;
+        // ADR-023: engine construction is the only reliable production call site
+        // for this global scope flag; mobile clients should not have to remember
+        // to toggle transport policy after every instantiation.
+        transport_encryption::enable_noise_transport();
 
         let rt = Runtime::new()
             .map_err(|e| AetherError::InternalError(format!("Tokio runtime init failed: {}", e)))?;
@@ -198,6 +234,7 @@ impl AetherEngine {
                 ticket_verify_failures: DashMap::new(),
                 manifest_sequences: DashMap::new(),
                 ticket_counters: DashMap::new(),
+                noise_sessions: DashMap::new(),
             }),
             rt: Arc::new(rt),
             self_peer_id: Arc::new(RwLock::new(default_id)),
@@ -259,6 +296,8 @@ impl AetherEngine {
         let bound_port = self.bound_port.clone();
         let self_peer_id = self.self_peer_id.clone();
         let self_public_key_x962 = self.self_public_key_x962.clone();
+        let noise_static_public_key = self.noise_static_public_key.clone();
+        let noise_static_private_key = self.noise_static_private_key.clone();
         let (tx, rx) = std::sync::mpsc::channel::<Result<u16, AetherError>>();
 
         self.rt.spawn(async move {
@@ -268,13 +307,16 @@ impl AetherEngine {
                     // ADR-001: inside spawned task — expect() with clear message
                     peer_id: self_peer_id.read().expect("ADR-001: self_peer_id read lock poisoned in spawn").clone(),
                     public_key_hex: hex::encode(self_public_key_x962.read().expect("ADR-001: self_public_key_x962 read lock poisoned in spawn").clone()),
+                    noise_static_public_key_hex: hex::encode(noise_static_public_key.read().expect("ADR-001: noise_static_public_key read lock poisoned in spawn").clone()),
                     protocol_version: Config::get_protocol_version().to_string(),
                 }),
+                noise_static_private_key,
             };
             let app = Router::new()
                 .route("/download", get(download_handler))
                 .route("/ping", get(ping_handler))
                 .route("/identity", get(identity_handler))
+                .route("/noise-handshake", post(noise_handshake_handler))
                 .with_state(state);
 
             match tokio::net::TcpListener::bind(Config::BIND_ADDRESS).await {
@@ -332,6 +374,9 @@ impl AetherEngine {
                                 now.saturating_sub(entry.last_failure_unix_secs)
                                     < Config::MAX_TICKET_VERIFY_FAILURE_TTL_SECS
                             });
+                        eviction_state
+                            .noise_sessions
+                            .retain(|_, entry| !entry.is_idle_expired(now));
                     }
                 }
             }
@@ -347,6 +392,8 @@ impl AetherEngine {
         // ADR-001: void return — expect() with clear messages instead of bare unwrap()
         self.state.shutdown_token.read().expect("ADR-001: shutdown_token read lock poisoned").cancel();
         *self.bound_port.write().expect("ADR-001: bound_port write lock poisoned") = None;
+        // ADR-019: Clear all Noise sessions on server stop to prevent session/auth divergence
+        self.state.noise_sessions.clear();
     }
 
     /// Returns `true` if the server is currently bound to a port.
@@ -470,10 +517,10 @@ impl AetherEngine {
         
         // First handshake step: initiator sends ephemeral key
         let msg = transport_encryption::perform_handshake(&mut session, &[])?;
-        
-        // Store session for next step
-        // Note: In full implementation, store session in a DashMap<String, NoiseSession>
-        
+        self.state
+            .noise_sessions
+            .insert(peer_id, NoiseSessionEntry::new(session, current_unix_secs()));
+
         Ok(msg)
     }
 
@@ -485,17 +532,25 @@ impl AetherEngine {
         peer_id: String,
         response: Vec<u8>,
     ) -> Result<(), AetherError> {
-        // Retrieve the stored session (in full implementation)
-        // For now, this is a stub that validates the response format
-        
-        if response.is_empty() {
-            return Err(AetherError::KeyExchangeFailed);
-        }
-        
-        // Session establishment would continue here
-        // The session keys would be stored for subsequent encrypt/decrypt operations
-        
-        Ok(())
+        self.rt
+            .block_on(complete_noise_handshake_on_state(&self.state, &peer_id, response))
+    }
+
+    /// Establish a Noise session with a remote peer over the `/noise-handshake`
+    /// endpoint and cache the established transport state for future requests.
+    pub fn establish_noise_session(
+        &self,
+        peer_ip: String,
+        peer_port: u16,
+        peer_id: String,
+    ) -> Result<(), AetherError> {
+        self.rt.block_on(establish_noise_session_on_state(
+            &self.state,
+            &peer_ip,
+            peer_port,
+            &self.get_self_peer_id(),
+            &peer_id,
+        ))
     }
 
     // ADR-019: Enable Noise transport encryption
@@ -533,6 +588,8 @@ impl AetherEngine {
         if self.state.peers.remove(&peer_id).is_none() {
             return Err(AetherError::PeerNotFound);
         }
+        // ADR-019: Invalidate Noise session to prevent stale session semantics after revoke
+        self.state.noise_sessions.remove(&peer_id);
         info!("Revoked peer: {peer_id}");
         Ok(())
     }
@@ -715,14 +772,32 @@ impl AetherEngine {
         self.verify_ticket_with_counter(&ticket, &peer_entry.keys.auth_key, &issuer_peer_id)?;
 
         let transport_key = peer_entry.keys.transport_key.clone();
+        let has_noise_key = peer_entry.keys.noise_remote_static_key.is_some();
+        let self_id = self.get_self_peer_id();
         drop(peer_entry); // release DashMap reference
 
-        let self_id = self.get_self_peer_id();
+        if transport_encryption::is_noise_enabled() && has_noise_key {
+            self.rt.block_on(establish_noise_session_on_state(
+                &self.state,
+                &peer_ip,
+                peer_port,
+                &self_id,
+                &seeder_peer_id,
+            ))?;
+        }
+        let noise_session = if transport_encryption::is_noise_enabled() && has_noise_key {
+            get_noise_session_handle(&self.state, &seeder_peer_id)
+        } else {
+            None
+        };
+
         self.rt.block_on(download_file_to_fd(
             peer_ip,
             peer_port,
             ticket,
             self_id,
+            seeder_peer_id,
+            noise_session,
             transport_key,
             expected_sha256,
             resume_from,
@@ -838,6 +913,27 @@ impl AetherEngine {
         Ok(self.rt.block_on(ping_peer(&peer_ip, peer_port)))
     }
 
+    pub fn ping_peer_secure(
+        &self,
+        peer_ip: String,
+        peer_port: u16,
+        peer_id: String,
+    ) -> Result<bool, AetherError> {
+        let self_id = self.get_self_peer_id();
+        self.rt.block_on(establish_noise_session_on_state(
+            &self.state,
+            &peer_ip,
+            peer_port,
+            &self_id,
+            &peer_id,
+        ))?;
+        let session = get_noise_session_handle(&self.state, &peer_id)
+            .ok_or_else(|| AetherError::SecurityError("Noise session unavailable".into()))?;
+        Ok(self
+            .rt
+            .block_on(ping_peer_secure(&peer_ip, peer_port, &self_id, session)))
+    }
+
     #[doc(hidden)]
     pub fn get_self_peer_id_for_test(&self) -> String {
         self.get_self_peer_id()
@@ -859,6 +955,71 @@ impl AetherEngine {
     fn has_file_registered_for_test(&self, model_id: &str) -> bool {
         self.state.serve_files.contains_key(model_id)
     }
+}
+
+fn get_noise_session_handle(
+    state: &AppState,
+    peer_id: &str,
+) -> Option<Arc<Mutex<transport_encryption::NoiseSession>>> {
+    let now = current_unix_secs();
+    state.noise_sessions.get(peer_id).map(|entry| {
+        entry.touch(now);
+        entry.session.clone()
+    })
+}
+
+async fn complete_noise_handshake_on_state(
+    state: &AppState,
+    peer_id: &str,
+    response: Vec<u8>,
+) -> Result<(), AetherError> {
+    if response.is_empty() {
+        return Err(AetherError::KeyExchangeFailed);
+    }
+
+    let session = get_noise_session_handle(state, peer_id).ok_or(AetherError::PeerNotFound)?;
+    let mut guard = session.lock().await;
+    transport_encryption::perform_handshake(&mut guard, &response)?;
+    Ok(())
+}
+
+async fn establish_noise_session_on_state(
+    state: &AppState,
+    peer_ip: &str,
+    peer_port: u16,
+    self_peer_id: &str,
+    peer_id: &str,
+) -> Result<(), AetherError> {
+    if let Some(session) = get_noise_session_handle(state, peer_id) {
+        let guard = session.lock().await;
+        if matches!(&*guard, transport_encryption::NoiseSession::Established(_)) {
+            return Ok(());
+        }
+    }
+
+    let remote_static_key = {
+        let entry = state.peers.get(peer_id).ok_or(AetherError::PeerNotFound)?;
+        entry
+            .keys
+            .noise_remote_static_key
+            .clone()
+            .ok_or(AetherError::KeyExchangeFailed)?
+    };
+
+    let mut session = transport_encryption::init_noise_initiator(&remote_static_key)?;
+    let request = transport_encryption::perform_handshake(&mut session, &[])?;
+    state
+        .noise_sessions
+        .insert(peer_id.to_string(), NoiseSessionEntry::new(session, current_unix_secs()));
+    let response = network::perform_noise_handshake(
+        peer_ip,
+        peer_port,
+        self_peer_id,
+        request,
+        Config::get_protocol_version(),
+    )
+    .await?;
+    complete_noise_handshake_on_state(state, peer_id, response).await
 }
 
 // ── Axum handlers ─────────────────────────────────────────────────────────────
@@ -1017,10 +1178,16 @@ async fn download_handler(
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Cannot open file").into_response(),
     };
     let transport_key = peer_ref.value().keys.transport_key.clone();
-
-    // ── Random nonce for this session (prevents keystream reuse across restarts)
-    let nonce = SecurityManager::generate_random_nonce();
-    let nonce_hex = hex::encode(nonce);
+    let noise_session = if transport_encryption::is_noise_enabled() {
+        get_noise_session_handle(&state.app, &peer_id)
+    } else {
+        None
+    };
+    let chacha_nonce = if noise_session.is_none() {
+        Some(SecurityManager::generate_random_nonce())
+    } else {
+        None
+    };
 
     // ── Range header handling ─────────────────────────────────────────────────
     let range_header = headers
@@ -1053,53 +1220,182 @@ async fn download_handler(
             content_len,
             &ticket_str,
             &transport_key,
-            &nonce,
+            chacha_nonce.as_ref(),
+            noise_session.clone(),
         );
 
         // ADR-001: unwrap_or_else with 500 fallback instead of bare unwrap()
-        return axum::http::Response::builder()
+        let mut builder = axum::http::Response::builder()
             .status(StatusCode::PARTIAL_CONTENT)
             .header(header::CONTENT_TYPE, "application/octet-stream")
-            .header("X-Aether-Encrypted", "chacha20")
-            .header("X-Aether-Nonce", &nonce_hex)
-            .header(header::CONTENT_LENGTH, content_len.to_string())
             .header(
                 "Content-Range",
                 format!("bytes {}-{}/{}", start, file_size - 1, file_size),
-            )
-            .body(Body::from_stream(stream))
-            .unwrap_or_else(|e| {
-                tracing::error!("ADR-001: Failed to build 206 response: {:?}", e);
-                let mut fb = axum::http::Response::new(Body::from("Internal response error"));
-                *fb.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                fb
-            });
-    }
-
-    // ── Full file response ────────────────────────────────────────────────────
-    let stream = encrypted_file_stream(file, 0, file_size, &ticket_str, &transport_key, &nonce);
-    // ADR-001: unwrap_or_else with 500 fallback instead of bare unwrap()
-    axum::http::Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .header("X-Aether-Encrypted", "chacha20")
-        .header("X-Aether-Nonce", &nonce_hex)
-        .header(header::CONTENT_LENGTH, file_size.to_string())
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|e| {
-            tracing::error!("ADR-001: Failed to build 200 response: {:?}", e);
+            );
+        let encoded_len = if noise_session.is_some() {
+            framed_noise_content_length(content_len)
+        } else {
+            content_len
+        };
+        builder = builder.header(header::CONTENT_LENGTH, encoded_len.to_string());
+        let mut response = builder.body(Body::from_stream(stream)).unwrap_or_else(|e| {
+            tracing::error!("ADR-001: Failed to build 206 response: {:?}", e);
             let mut fb = axum::http::Response::new(Body::from("Internal response error"));
             *fb.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
             fb
-        })
+        });
+        if noise_session.is_some() {
+            response.headers_mut().insert(
+                header::HeaderName::from_static("x-aether-encrypted"),
+                header::HeaderValue::from_static("noise-nk"),
+            );
+        } else {
+            let nonce_hex = hex::encode(chacha_nonce.expect("nonce must exist for chacha20 fallback"));
+            response.headers_mut().insert(
+                header::HeaderName::from_static("x-aether-encrypted"),
+                header::HeaderValue::from_static("chacha20"),
+            );
+            if let Ok(value) = header::HeaderValue::from_str(&nonce_hex) {
+                response.headers_mut().insert(
+                    header::HeaderName::from_static("x-aether-nonce"),
+                    value,
+                );
+            }
+        }
+        return response;
+    }
+
+    // ── Full file response ────────────────────────────────────────────────────
+    let stream = encrypted_file_stream(
+        file,
+        0,
+        file_size,
+        &ticket_str,
+        &transport_key,
+        chacha_nonce.as_ref(),
+        noise_session.clone(),
+    );
+    // ADR-001: unwrap_or_else with 500 fallback instead of bare unwrap()
+    let mut builder = axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream");
+    let encoded_len = if noise_session.is_some() {
+        framed_noise_content_length(file_size)
+    } else {
+        file_size
+    };
+    builder = builder.header(header::CONTENT_LENGTH, encoded_len.to_string());
+    let mut response = builder.body(Body::from_stream(stream)).unwrap_or_else(|e| {
+        tracing::error!("ADR-001: Failed to build 200 response: {:?}", e);
+        let mut fb = axum::http::Response::new(Body::from("Internal response error"));
+        *fb.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        fb
+    });
+    if noise_session.is_some() {
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-aether-encrypted"),
+            header::HeaderValue::from_static("noise-nk"),
+        );
+    } else {
+        let nonce_hex = hex::encode(chacha_nonce.expect("nonce must exist for chacha20 fallback"));
+        response.headers_mut().insert(
+            header::HeaderName::from_static("x-aether-encrypted"),
+            header::HeaderValue::from_static("chacha20"),
+        );
+        if let Ok(value) = header::HeaderValue::from_str(&nonce_hex) {
+            response.headers_mut().insert(
+                header::HeaderName::from_static("x-aether-nonce"),
+                value,
+            );
+        }
+    }
+    response
 }
 
-async fn ping_handler() -> impl IntoResponse {
-    (StatusCode::OK, Config::get_protocol_version())
+async fn ping_handler(
+    State(state): State<ServerState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(peer_id) = params.get("pid") {
+        // ADR-020: Secure ping requires peer to remain in live authorization graph
+        if !state.app.peers.contains_key(peer_id) {
+            return (StatusCode::FORBIDDEN, "Unknown peer identity").into_response();
+        }
+        if let Some(session) = get_noise_session_handle(&state.app, peer_id) {
+            let mut guard = session.lock().await;
+            match transport_encryption::encrypt(
+                &mut guard,
+                Config::get_protocol_version().as_bytes(),
+            ) {
+                Ok(ciphertext) => {
+                    let mut response = axum::http::Response::new(Body::from(ciphertext));
+                    *response.status_mut() = StatusCode::OK;
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("application/octet-stream"),
+                    );
+                    response.headers_mut().insert(
+                        header::HeaderName::from_static("x-aether-encrypted"),
+                        header::HeaderValue::from_static("noise-nk"),
+                    );
+                    return response;
+                }
+                Err(e) => {
+                    tracing::warn!("Noise ping encryption failed for peer {}: {}", peer_id, e);
+                }
+            }
+        }
+    }
+
+    (StatusCode::OK, Config::get_protocol_version()).into_response()
 }
 
 async fn identity_handler(State(state): State<ServerState>) -> impl IntoResponse {
     axum::Json((*state.identity).clone())
+}
+
+async fn noise_handshake_handler(
+    State(state): State<ServerState>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    let peer_id = match params.get("pid") {
+        Some(id) => id.clone(),
+        None => return (StatusCode::BAD_REQUEST, "Missing pid").into_response(),
+    };
+    if !state.app.peers.contains_key(&peer_id) {
+        return (StatusCode::FORBIDDEN, "Unknown peer identity").into_response();
+    }
+
+    let private_key = match state.noise_static_private_key.read() {
+        Ok(g) => g.0.clone(),
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Noise key unavailable").into_response()
+        }
+    };
+
+    let mut session = match transport_encryption::init_noise_responder(&private_key) {
+        Ok(session) => session,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Noise init failed").into_response(),
+    };
+
+    let response = match transport_encryption::perform_handshake(&mut session, &body) {
+        Ok(response) => response,
+        Err(_) => return (StatusCode::FORBIDDEN, "Invalid handshake").into_response(),
+    };
+
+    state
+        .app
+        .noise_sessions
+        .insert(peer_id, NoiseSessionEntry::new(session, current_unix_secs()));
+
+    let mut handshake_response = axum::http::Response::new(Body::from(response));
+    *handshake_response.status_mut() = StatusCode::OK;
+    handshake_response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/octet-stream"),
+    );
+    handshake_response
 }
 
 fn reject_replayed_ticket(
@@ -1177,13 +1473,25 @@ fn record_ticket_verify_failure(state: &AppState, peer_id: &str) {
         });
 }
 
+fn framed_noise_content_length(plaintext_len: u64) -> u64 {
+    let chunk_size = 64 * 1024u64;
+    let frame_overhead = (4 + 16) as u64;
+    let frames = if plaintext_len == 0 {
+        0
+    } else {
+        (plaintext_len + chunk_size - 1) / chunk_size
+    };
+    plaintext_len + frames * frame_overhead
+}
+
 fn encrypted_file_stream(
     mut file: tokio::fs::File,
     start: u64,
     remaining_len: u64,
     ticket: &str,
     transport_key: &SecureKey,
-    nonce: &[u8; 12],
+    chacha_nonce: Option<&[u8; 12]>,
+    noise_session: Option<Arc<Mutex<transport_encryption::NoiseSession>>>,
 ) -> impl futures_util::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     // Extract model_id from ticket for HKDF salt (not the ticket itself).
     let model_id = match SecurityManager::extract_model_id(ticket) {
@@ -1194,16 +1502,21 @@ fn encrypted_file_stream(
         }
     };
     let transport_key = transport_key.clone();
-    let nonce = *nonce;
+    let chacha_nonce = chacha_nonce.copied();
     let stream: BoxStream<'static, Result<Bytes, std::io::Error>> = try_stream! {
-        let session_key = SecurityManager::derive_session_stream_key(&transport_key, &model_id)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        let mut cipher = ChaCha20::new((&session_key).into(), (&nonce).into());
         file.seek(std::io::SeekFrom::Start(start)).await?;
-        cipher.seek(start);
-
         let mut sent = 0u64;
         let mut buf = vec![0u8; 64 * 1024];
+        let mut cipher = match chacha_nonce {
+            Some(nonce) => {
+                let session_key = SecurityManager::derive_session_stream_key(&transport_key, &model_id)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let mut cipher = ChaCha20::new((&session_key).into(), (&nonce).into());
+                cipher.seek(start);
+                Some(cipher)
+            }
+            None => None,
+        };
         while sent < remaining_len {
             // ADR-001: safe fallback instead of bare unwrap() — value is clamped by .min(buf.len())
             // so it always fits in usize, but use unwrap_or for explicit safety
@@ -1213,7 +1526,17 @@ fn encrypted_file_stream(
                 break;
             }
             let mut chunk = buf[..n].to_vec();
-            cipher.apply_keystream(&mut chunk);
+            if let Some(ref mut cipher) = cipher {
+                cipher.apply_keystream(&mut chunk);
+            } else if let Some(ref session) = noise_session {
+                let mut guard = session.lock().await;
+                let ciphertext = transport_encryption::encrypt(&mut guard, &chunk)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let mut framed = Vec::with_capacity(4 + ciphertext.len());
+                framed.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+                framed.extend_from_slice(&ciphertext);
+                chunk = framed;
+            }
             sent += n as u64;
             yield Bytes::from(chunk);
         }
@@ -1738,5 +2061,133 @@ mod tests {
 
         // Verify it was stored
         assert!(engine.has_file_registered_for_test("test-model"));
+    }
+
+    #[test]
+    fn establish_noise_session_enables_secure_ping() {
+        let seeder = AetherEngine::new().unwrap();
+        let leecher = AetherEngine::new().unwrap();
+
+        seeder.set_self_peer_id("seeder".into());
+        leecher.set_self_peer_id("leecher".into());
+        seeder
+            .set_self_identity_public_key(vec![0x04u8; 65])
+            .unwrap();
+
+        let shared_secret = vec![0x33u8; 32];
+        seeder
+            .register_peer_key("leecher".into(), shared_secret.clone())
+            .unwrap();
+        leecher
+            .register_peer_key("seeder".into(), shared_secret)
+            .unwrap();
+        leecher
+            .register_peer_noise_static_key(
+                "seeder".into(),
+                seeder.get_noise_static_public_key_for_test(),
+            )
+            .unwrap();
+
+        let port = seeder.start_server().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        leecher
+            .establish_noise_session("127.0.0.1".into(), port, "seeder".into())
+            .unwrap();
+        assert!(leecher
+            .ping_peer_secure("127.0.0.1".into(), port, "seeder".into())
+            .unwrap());
+
+        seeder.stop_server();
+    }
+
+    #[test]
+    fn download_model_uses_noise_session_when_available() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::fd::IntoRawFd;
+        use tempfile::NamedTempFile;
+
+        let seeder = AetherEngine::new().unwrap();
+        let leecher = AetherEngine::new().unwrap();
+
+        seeder.set_self_peer_id("seeder".into());
+        leecher.set_self_peer_id("leecher".into());
+        seeder
+            .set_self_identity_public_key(vec![0x04u8; 65])
+            .unwrap();
+
+        let shared_secret = vec![0x55u8; 32];
+        seeder
+            .register_peer_key("leecher".into(), shared_secret.clone())
+            .unwrap();
+        seeder
+            .grant_peer_model_access("leecher".into(), "model-a".into())
+            .unwrap();
+        leecher
+            .register_peer_key("seeder".into(), shared_secret.clone())
+            .unwrap();
+        leecher
+            .register_peer_noise_static_key(
+                "seeder".into(),
+                seeder.get_noise_static_public_key_for_test(),
+            )
+            .unwrap();
+
+        let mut src = NamedTempFile::new().unwrap();
+        let payload = b"noise-backed download payload";
+        src.write_all(payload).unwrap();
+        src.flush().unwrap();
+        seeder
+            .register_file_for_serving("model-a".into(), src.path().to_str().unwrap().into())
+            .unwrap();
+
+        let port = seeder.start_server().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let derived = SecurityManager::derive_hmac_key(&shared_secret).unwrap();
+        let ticket = SecurityManager::generate_ticket(
+            "model-a",
+            "1",
+            "seeder",
+            &SecureKey(derived.to_vec()),
+        )
+        .unwrap();
+        let expected_sha = {
+            let mut hasher = Sha256::new();
+            hasher.update(payload);
+            hex::encode(hasher.finalize())
+        };
+
+        let out = NamedTempFile::new().unwrap();
+        let fd = std::fs::OpenOptions::new()
+            .write(true)
+            .read(true)
+            .open(out.path())
+            .unwrap()
+            .into_raw_fd();
+
+        leecher
+            .download_model(
+                "127.0.0.1".into(),
+                port,
+                "seeder".into(),
+                ticket,
+                expected_sha,
+                0,
+                fd,
+            )
+            .unwrap();
+
+        let mut out_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(out.path())
+            .unwrap();
+        out_file.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = Vec::new();
+        out_file.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, payload);
+        assert!(leecher.state.noise_sessions.contains_key("seeder"));
+
+        seeder.stop_server();
     }
 }

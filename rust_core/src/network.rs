@@ -9,14 +9,17 @@
 use crate::config::Config;
 use crate::error::AetherError;
 use crate::security::{SecureKey, SecurityManager};
+use crate::transport_encryption;
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::ChaCha20;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::FromRawFd;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
 // ── Security helpers ────────────────────────────────────────────────────────
@@ -52,6 +55,7 @@ fn validate_header_value(value: &str) -> Result<(), AetherError> {
 struct HttpResponse {
     content_length: Option<u64>,
     nonce_hex: Option<String>,
+    encrypted_scheme: Option<String>,
     body_prefix: Vec<u8>,
 }
 
@@ -124,14 +128,50 @@ async fn read_http_response(stream: &mut TcpStream) -> Result<HttpResponse, Aeth
                 .find(|l| l.to_ascii_lowercase().starts_with("x-aether-nonce:"))
                 .and_then(|l| l.split_once(':').map(|(_, v)| v))
                 .map(|v| v.trim().to_string());
+            let encrypted_scheme: Option<String> = header_str
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("x-aether-encrypted:"))
+                .and_then(|l| l.split_once(':').map(|(_, v)| v))
+                .map(|v| v.trim().to_string());
 
             return Ok(HttpResponse {
                 content_length,
                 nonce_hex,
+                encrypted_scheme,
                 body_prefix,
             });
         }
         // `\r\n\r\n` not yet in buffer — read the next TCP segment.
+    }
+}
+
+async fn drain_noise_frames(
+    pending: &mut Vec<u8>,
+    session: &Arc<Mutex<transport_encryption::NoiseSession>>,
+    file: &mut tokio::fs::File,
+    hasher: &mut Sha256,
+    written: &mut u64,
+) -> Result<(), AetherError> {
+    loop {
+        if pending.len() < 4 {
+            return Ok(());
+        }
+        let frame_len = u32::from_be_bytes([pending[0], pending[1], pending[2], pending[3]]) as usize;
+        if pending.len() < 4 + frame_len {
+            return Ok(());
+        }
+        let ciphertext = pending[4..4 + frame_len].to_vec();
+        pending.drain(..4 + frame_len);
+
+        let plaintext = {
+            let mut guard = session.lock().await;
+            transport_encryption::decrypt(&mut guard, &ciphertext)?
+        };
+        file.write_all(&plaintext)
+            .await
+            .map_err(|e| AetherError::NetworkError(format!("Write failed: {}", e)))?;
+        hasher.update(&plaintext);
+        *written += plaintext.len() as u64;
     }
 }
 
@@ -154,6 +194,8 @@ pub async fn download_file_to_fd(
     peer_port: u16,
     ticket: String,
     self_peer_id: String,
+    seeder_peer_id: String,
+    noise_session: Option<Arc<Mutex<transport_encryption::NoiseSession>>>,
     transport_key: SecureKey,
     expected_sha256: String,
     resume_from: u64,
@@ -216,70 +258,136 @@ pub async fn download_file_to_fd(
     // Parse the random nonce from the X-Aether-Nonce response header.
     // The seeder generates a fresh random nonce per session, eliminating
     // keystream-reuse risk even if the same ticket is replayed after restart.
-    let nonce_bytes: [u8; 12] = resp
-        .nonce_hex
-        .as_deref()
-        .and_then(|h| hex::decode(h).ok())
-        .filter(|b| b.len() == 12)
-        .and_then(|b| {
-            let mut arr = [0u8; 12];
-            arr.copy_from_slice(&b);
-            Some(arr)
-        })
-        .ok_or_else(|| {
-            AetherError::SecurityError(
-                "Missing or invalid X-Aether-Nonce header from seeder".into(),
-            )
-        })?;
-
     let mut async_file = tokio::fs::File::from_std(file);
     let mut hasher = Sha256::new();
     let mut written = 0u64;
-    // Extract model_id from ticket payload for HKDF salt (not the ticket itself).
-    // Ticket format: <model_id>|<version>|<timestamp>|<issuer_peer_id>.<HMAC>
-    let model_id = SecurityManager::extract_model_id(&ticket)?;
-    let session_key = SecurityManager::derive_session_stream_key(&transport_key, model_id)?;
-    let mut cipher = ChaCha20::new((&session_key).into(), (&nonce_bytes).into());
-    cipher.seek(resume_from);
+    let encrypted_scheme = resp
+        .encrypted_scheme
+        .as_deref()
+        .unwrap_or("chacha20")
+        .to_ascii_lowercase();
+    let payload_content_length = if encrypted_scheme == "noise-nk" {
+        None
+    } else {
+        resp.content_length
+    };
+    let mut cipher = if encrypted_scheme == "noise-nk" {
+        None
+    } else {
+        let nonce_bytes: [u8; 12] = resp
+            .nonce_hex
+            .as_deref()
+            .and_then(|h| hex::decode(h).ok())
+            .filter(|b| b.len() == 12)
+            .and_then(|b| {
+                let mut arr = [0u8; 12];
+                arr.copy_from_slice(&b);
+                Some(arr)
+            })
+            .ok_or_else(|| {
+                AetherError::SecurityError(
+                    "Missing or invalid X-Aether-Nonce header from seeder".into(),
+                )
+            })?;
+        let model_id = SecurityManager::extract_model_id(&ticket)?;
+        let session_key = SecurityManager::derive_session_stream_key(&transport_key, model_id)?;
+        let mut cipher = ChaCha20::new((&session_key).into(), (&nonce_bytes).into());
+        cipher.seek(resume_from);
+        Some(cipher)
+    };
+    let noise_session = if encrypted_scheme == "noise-nk" {
+        noise_session.ok_or_else(|| {
+            AetherError::SecurityError(format!(
+                "Missing Noise session for peer {}",
+                seeder_peer_id
+            ))
+        })?
+    } else {
+        noise_session.unwrap_or_else(|| {
+            Arc::new(Mutex::new(transport_encryption::NoiseSession::Uninitialized))
+        })
+    };
 
+    let mut chunk_buf = vec![0u8; 64 * 1024]; // 64 KB read chunks
+    let mut pending_noise = Vec::new();
     // Body bytes that arrived in the same reads as the headers.
     if !resp.body_prefix.is_empty() {
-        let mut decrypted = resp.body_prefix.clone();
-        cipher.apply_keystream(&mut decrypted);
-        async_file
-            .write_all(&decrypted)
-            .await
-            .map_err(|e| AetherError::InternalError(format!("Initial write failed: {}", e)))?;
-        hasher.update(&decrypted);
-        written += decrypted.len() as u64;
+        if let Some(ref mut cipher) = cipher {
+            let mut decrypted = resp.body_prefix.clone();
+            cipher.apply_keystream(&mut decrypted);
+            async_file
+                .write_all(&decrypted)
+                .await
+                .map_err(|e| AetherError::InternalError(format!("Initial write failed: {}", e)))?;
+            hasher.update(&decrypted);
+            written += decrypted.len() as u64;
+        } else {
+            pending_noise.extend_from_slice(&resp.body_prefix);
+            drain_noise_frames(
+                &mut pending_noise,
+                &noise_session,
+                &mut async_file,
+                &mut hasher,
+                &mut written,
+            )
+            .await?;
+        }
     }
 
     // Fully async transfer loop — no blocking I/O, no thread starvation.
-    let mut chunk_buf = vec![0u8; 64 * 1024]; // 64 KB read chunks
     loop {
         match stream.read(&mut chunk_buf).await {
             Ok(0) => break,
             Ok(k) => {
-                let mut decrypted = chunk_buf[..k].to_vec();
-                cipher.apply_keystream(&mut decrypted);
-                async_file
-                    .write_all(&decrypted)
-                    .await
-                    .map_err(|e| AetherError::NetworkError(format!("Write failed: {}", e)))?;
-                hasher.update(&decrypted);
-                written += k as u64;
+                if let Some(ref mut cipher) = cipher {
+                    let mut decrypted = chunk_buf[..k].to_vec();
+                    cipher.apply_keystream(&mut decrypted);
+                    async_file
+                        .write_all(&decrypted)
+                        .await
+                        .map_err(|e| AetherError::NetworkError(format!("Write failed: {}", e)))?;
+                    hasher.update(&decrypted);
+                    written += k as u64;
+                } else {
+                    pending_noise.extend_from_slice(&chunk_buf[..k]);
+                    drain_noise_frames(
+                        &mut pending_noise,
+                        &noise_session,
+                        &mut async_file,
+                        &mut hasher,
+                        &mut written,
+                    )
+                    .await?;
+                }
             }
             Err(e) => return Err(AetherError::NetworkError(format!("Read failed: {}", e))),
         }
     }
+    if cipher.is_none() && !pending_noise.is_empty() {
+        return Err(AetherError::DownloadIncomplete {
+            received: written,
+            expected: written + pending_noise.len() as u64,
+        });
+    }
 
+    finalize_download(async_file, hasher, written, payload_content_length, expected_sha256, resume_from).await
+}
+
+async fn finalize_download(
+    mut async_file: tokio::fs::File,
+    hasher: Sha256,
+    written: u64,
+    expected_len: Option<u64>,
+    expected_sha256: String,
+    resume_from: u64,
+) -> Result<(), AetherError> {
     async_file
         .flush()
         .await
         .map_err(|e| AetherError::NetworkError(format!("Flush failed: {}", e)))?;
 
     // ── Content-Length check ──────────────────────────────────────────────────
-    if let Some(expected_len) = resp.content_length {
+    if let Some(expected_len) = expected_len {
         if written != expected_len {
             return Err(AetherError::DownloadIncomplete {
                 received: written,
@@ -288,7 +396,7 @@ pub async fn download_file_to_fd(
         }
     }
 
-    info!("Download complete: {} bytes written to fd {}", written, fd);
+    info!("Download complete: {} bytes written", written);
 
     // ── SHA-256 verification ──────────────────────────────────────────────────
     if !expected_sha256.is_empty() {
@@ -409,6 +517,127 @@ pub async fn ping_peer(peer_ip: &str, peer_port: u16) -> bool {
         );
     }
     alive
+}
+
+pub async fn perform_noise_handshake(
+    peer_ip: &str,
+    peer_port: u16,
+    self_peer_id: &str,
+    request: Vec<u8>,
+    protocol_version: &str,
+) -> Result<Vec<u8>, AetherError> {
+    let addr = format!("{}:{}", peer_ip, peer_port);
+    let mut stream = TcpStream::connect(&addr)
+        .await
+        .map_err(|e| AetherError::NetworkError(format!("Connect failed: {}", e)))?;
+
+    validate_header_value(self_peer_id)?;
+    let req = format!(
+        "POST /noise-handshake?pid={} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         X-Aether-Protocol: {}\r\n\
+         Content-Type: application/octet-stream\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        self_peer_id,
+        peer_ip,
+        protocol_version,
+        request.len()
+    );
+    stream
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| AetherError::NetworkError(format!("Handshake request send failed: {}", e)))?;
+    stream
+        .write_all(&request)
+        .await
+        .map_err(|e| AetherError::NetworkError(format!("Handshake body send failed: {}", e)))?;
+
+    let resp = read_http_response(&mut stream).await?;
+    let mut body = resp.body_prefix;
+    let mut tmp = [0u8; Config::HEADER_READ_CHUNK];
+    loop {
+        match stream.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&tmp[..n]),
+            Err(e) => {
+                return Err(AetherError::NetworkError(format!(
+                    "Handshake read failed: {}",
+                    e
+                )))
+            }
+        }
+    }
+    Ok(body)
+}
+
+pub async fn ping_peer_secure(
+    peer_ip: &str,
+    peer_port: u16,
+    self_peer_id: &str,
+    session: Arc<Mutex<transport_encryption::NoiseSession>>,
+) -> bool {
+    let addr = format!("{}:{}", peer_ip, peer_port);
+    let mut stream = match TcpStream::connect(&addr).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            warn!("Peer {} unreachable for secure ping: {}", addr, e);
+            return false;
+        }
+    };
+
+    if let Err(e) = validate_header_value(self_peer_id) {
+        warn!("Secure ping rejected invalid peer id: {}", e);
+        return false;
+    }
+
+    let req = format!(
+        "GET /ping?pid={} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         X-Aether-Protocol: {}\r\n\
+         Connection: close\r\n\r\n",
+        self_peer_id,
+        peer_ip,
+        Config::get_protocol_version(),
+    );
+
+    if let Err(e) = stream.write_all(req.as_bytes()).await {
+        warn!("Peer {} secure ping request failed: {}", addr, e);
+        return false;
+    }
+
+    let resp = match read_http_response(&mut stream).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!("Peer {} secure ping response invalid: {}", addr, e);
+            return false;
+        }
+    };
+
+    let mut body = resp.body_prefix;
+    let mut tmp = [0u8; 256];
+    loop {
+        match stream.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => body.extend_from_slice(&tmp[..n]),
+            Err(e) => {
+                warn!("Peer {} secure ping body read failed: {}", addr, e);
+                return false;
+            }
+        }
+    }
+
+    let plaintext = {
+        let mut guard = session.lock().await;
+        match transport_encryption::decrypt(&mut guard, &body) {
+            Ok(plaintext) => plaintext,
+            Err(e) => {
+                warn!("Peer {} secure ping decrypt failed: {}", addr, e);
+                return false;
+            }
+        }
+    };
+    plaintext == Config::get_protocol_version().as_bytes()
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -550,6 +779,8 @@ mod tests {
             1,
             "ticket".into(),
             "peer-a".into(),
+            "peer-b".into(),
+            None,
             SecureKey(vec![7u8; 32]),
             "00".repeat(32),
             0,

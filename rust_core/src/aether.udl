@@ -51,6 +51,9 @@ interface AetherEngine {
     [Throws=AetherError]
     void complete_noise_handshake(string peer_id, bytes response);
 
+    [Throws=AetherError]
+    void establish_noise_session(string peer_ip, u16 peer_port, string peer_id);
+
     // ADR-019: Enable Noise transport encryption
     void enable_noise_transport();
 
@@ -116,4 +119,7 @@ interface AetherEngine {
 
     [Throws=AetherError]
     boolean ping_peer(string peer_ip, u16 peer_port);
+
+    [Throws=AetherError]
+    boolean ping_peer_secure(string peer_ip, u16 peer_port, string peer_id);
 };

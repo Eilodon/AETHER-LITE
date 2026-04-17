@@ -118,7 +118,9 @@ final class AetherManager: ObservableObject {
         let doc = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         guard let peerId = doc?["peer_id"] as? String,
               let publicKeyHex = doc?["public_key_hex"] as? String,
+              let noiseStaticPublicKeyHex = doc?["noise_static_public_key_hex"] as? String,
               !publicKeyHex.isEmpty,
+              !noiseStaticPublicKeyHex.isEmpty,
               let publicKey = Data(hexString: publicKeyHex)
         else {
             throw AetherError.InternalError("Peer identity document invalid")
@@ -167,6 +169,11 @@ final class AetherManager: ObservableObject {
         }
 
         try engine.registerPeerKey(peerId: peerId, sharedSecret: [UInt8](sharedSecret))
+        try engine.registerPeerNoiseStaticKey(
+            peerId: peerId,
+            publicKey: Array(Data(hexString: noiseStaticPublicKeyHex) ?? Data())
+        )
+        try engine.establishNoiseSession(peerIp: peerIp, peerPort: peerPort, peerId: peerId)
         peerPinStore.save(trustDecision.pin)
         return (peerId, fingerprint, trustDecision.trustEstablishedNow)
     }
@@ -382,10 +389,13 @@ final class AetherManager: ObservableObject {
 
     // ── Peer Ping ──────────────────────────────────────────────────────────────
 
-    func pingPeer(ip: String, port: UInt16) async -> Bool {
+    func pingPeer(ip: String, port: UInt16, peerId: String? = nil) async -> Bool {
         do {
             return try await Task.detached(priority: .utility) {
-                try self.engine?.pingPeer(peerIp: ip, peerPort: port) ?? false
+                if let peerId {
+                    return try self.engine?.pingPeerSecure(peerIp: ip, peerPort: port, peerId: peerId) ?? false
+                }
+                return try self.engine?.pingPeer(peerIp: ip, peerPort: port) ?? false
             }.value
         } catch {
             return false

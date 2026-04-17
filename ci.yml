@@ -234,10 +234,10 @@ jobs:
         run: cargo build --target aarch64-apple-ios-sim --release
 
       - name: Run iOS XCTests
-        working-directory: ios/AetherLite
+        working-directory: ios/AetherApp
         run: |
           xcodebuild test \
-            -scheme AetherLite \
+            -scheme AetherApp \
             -destination 'platform=iOS Simulator,name=iPhone 16,OS=latest' \
             -resultBundlePath TestResults.xcresult \
             CODE_SIGNING_ALLOWED=NO | xcpretty

@@ -138,8 +138,9 @@ pub struct NoiseTransportSession {
 /// When false (legacy), plaintext HTTP is used.
 /// 
 /// Migration path:
-/// - Phase 1 (HandshakeGated): Default false, opt-in via config
-/// - Phase 2 (Enforced): Always true, plaintext fallback removed
+/// - Phase 1 (HandshakeGated): enabled during `AetherEngine::new()` while
+///   endpoint-level transport integration is rolled out incrementally.
+/// - Phase 2 (Enforced): Always true, plaintext fallback removed.
 static NOISE_ENABLED: std::sync::LazyLock<std::sync::atomic::AtomicBool> =
     std::sync::LazyLock::new(|| std::sync::atomic::AtomicBool::new(false));
 
@@ -434,9 +435,12 @@ mod tests {
     }
 
     #[test]
-    fn adr018_scope_locks_c1_endpoints() {
+    fn adr018_scope_c1_endpoints_match_contract() {
         let scope = current_scope();
-        assert_eq!(scope.phase, Adr018Phase::ScopeLocked);
+        assert!(matches!(
+            scope.phase,
+            Adr018Phase::ScopeLocked | Adr018Phase::HandshakeGated
+        ));
         assert_eq!(
             scope.protected_endpoints,
             &[
