@@ -757,3 +757,318 @@ xcodebuild test -scheme AetherApp ...
 ```
 **Rejected Alternatives:** leave drift in place, treat CI as illustrative only, defer until release.  
 **Initial weight:** 1.0 | **λ:** 0.20 | **Energy Tax priority:** 0.81
+
+---
+
+## [V] Vision — Cycle #4 — 2026-04-19
+
+### C4 Model
+```
+[Embedding App / Operator]
+    ├──► [Android SDK service layer]
+    ├──► [iOS SDK manager layer]
+    └──► [forge.py release tool]
+
+[Android SDK / iOS SDK] ── UniFFI ──► [Rust Core]
+    ├── peer onboarding + trust pin store
+    ├── manifest verification helpers
+    └── heartbeat / lifecycle orchestration
+
+[Rust Core]
+    ├── Axum endpoints: /identity, /noise-handshake, /download, /ping
+    ├── peer/session state + rate limiting
+    ├── patcher / decompressor / network
+    └── transport_encryption (Noise NK + ChaCha20 fallback/defense-in-depth)
+
+[forge.py] ── signs manifests ──► [CDN / offline package distribution]
+```
+
+### Bounded Contexts
+| Context | Owner | Depends On | Consumers | Notes |
+|---|---|---|---|---|
+| Rust transport/auth core | Rust | Axum, tokio, snow | Android, iOS | Highest coupling and strongest runtime guarantees |
+| Mobile onboarding/trust | Kotlin, Swift | SecureVault/Vault, PeerTrust, Rust FFI | Embedding app | Behavior now stricter than README |
+| Update verification | Rust, Kotlin, Swift, Python | canonical JSON, ECDSA, manifest sequence store | Mobile update flow | Sequence rollback protection is implemented |
+| CI / release guardrail | GitHub Actions + docs | repo layout, tool availability | Maintainers, contributors | Current weakest operational boundary |
+
+### Resource Budget
+| Resource | Budget | Unit | Alert Threshold | Notes |
+|---|---|---|---|---|
+| Time | 1 | audit cycle | 80% | source-first deep audit only |
+| Compute | UNCONSTRAINED | local CPU | 80% | Rust tests feasible locally |
+| Team bandwidth | UNCONSTRAINED | eng-hours | 80% | no transforms applied this cycle |
+| Release trust | HIGH | qualitative | any false CI green/red claim | main audit target this cycle |
+
+### Flags
+- Architecture type: cross-platform SDK with Rust core and mobile wrappers
+- Known high-coupling areas: Rust↔UniFFI↔mobile wrappers, CI↔docs↔repo layout
+- Areas explicitly OUT of scope this cycle: full transport redesign, device integrity attestation, admin key rotation
+
+## [G] Diagnose — Cycle #4 — 2026-04-19
+
+### Root Cause Taxonomy Scan
+Layer 1 — Connection Lifecycle: RELEVANT  
+Hypothesis: current runtime transport path is healthier than prior KB/docs suggest; the real operational weakness has shifted to lifecycle around CI validation and release assertions.  
+Evidence so far: local Rust suite passes; Noise/session state exists in runtime code.
+
+Layer 2 — Serialization Boundary: RELEVANT  
+Hypothesis: docs/KB still describe removed gaps (`sequence`, header-length cap) and therefore mis-specify current contracts to integrators.  
+Evidence so far: `forge.py`, mobile manifest verification helpers, and Rust config all implement protections absent from old KB text.
+
+Layer 3 — Async/Sync Boundary: RELEVANT  
+Hypothesis: CI jobs encode assumptions about host capabilities that do not match the runner OS, causing gate failure independent of product correctness.  
+Evidence so far: Android instrumented job runs Linux-only `udevadm`/KVM commands on `macos-latest`.
+
+Layer 4 — Type Contract: RELEVANT  
+Hypothesis: README protocol flow is contractually stale and tells callers to use a TOFU path that runtime code explicitly rejects over plaintext `/identity`.  
+Evidence so far: both Android and iOS throw when `trustOnFirstUse` is used without an existing pin or verified fingerprint.
+
+Layer 5 — Graph/State Lifecycle: RELEVANT  
+Hypothesis: prior VHEATM cycles resolved several runtime findings, but KB state was not fully decayed/updated, so audit history now overstates current unresolved security gaps.  
+Evidence so far: old sections still say no Noise, no manifest sequence, no header value limit.
+
+Layer 6 — Error Propagation: PARTIALLY RELEVANT  
+Hypothesis: the bigger present issue is observability truthfulness, not raw exception leakage; contributors can be misled by README/KB/CI even when runtime code is sound.  
+Evidence so far: README claims all 191 tests are CI-enforced; local verification plus CI file show a likely broken required job.
+
+### Hypothesis Table
+| ID | Hypothesis | Components Affected | Blast Radius | Verify Priority |
+|---|---|---|---|---|
+| H-41 | Android instrumented CI job is misconfigured for macOS and can block/poison the release gate | CI, contributors, PR gating | 🔴 HIGH | Immediate |
+| H-42 | Project docs/KB materially misdescribe current transport, manifest, and onboarding behavior | README, KB, embedding integrators | 🟠 MEDIUM | Immediate |
+| H-43 | Runtime Rust core is healthier than prior audit history indicates | Rust core, mobile wrappers | 🟠 MEDIUM | After H-41/H-42 |
+
+### Complexity Gate Result
+Scores: [coupling, state, async, silence, time] = [4, 3, 4, 4, 4]
+avg = 3.8 → Debate triggered
+
+### Debate Result
+Proposer:
+- H-41: CI host/runner mismatch is the most operationally dangerous current fault. | Confidence: 95% | Est. simulation cost: micro_sim_small | Est. USD: $0.01
+- H-42: docs and KB are stale enough to create wrong integration and threat-model assumptions. | Confidence: 90% | Est. simulation cost: micro_sim_small | Est. USD: $0.01
+- H-43: runtime transport/security improvements are implemented and should be treated as confirmed baseline, not open risk. | Confidence: 85% | Est. simulation cost: micro_sim_small | Est. USD: $0.01
+
+Critic:
+- H-41: APPROVED | Cost check: $0.01 vs remaining budget UNCONSTRAINED → APPROVED
+- H-42: APPROVED | Cost check: $0.01 vs remaining budget UNCONSTRAINED → APPROVED
+- H-43: APPROVED | Cost check: $0.01 vs remaining budget UNCONSTRAINED → APPROVED
+
+Synthesizer:
+- Final order: H-41 → H-42 → H-43
+
+### Final Hypothesis Queue (→ [E])
+| ID | Hypothesis | Blast Radius | Sim Type | Est. Cost |
+|---|---|---|---|---|
+| H-41 | Android instrumented CI runner assumptions are invalid on macOS | 🔴 HIGH | micro_sim_small | $0.01 |
+| H-42 | README/KB drift materially misstates current contracts and protections | 🟠 MEDIUM | micro_sim_small | $0.01 |
+| H-43 | Rust runtime path is stronger than previous audit state implies | 🟠 MEDIUM | micro_sim_small | $0.01 |
+
+## [E] Verify — Cycle #4 — 2026-04-19
+
+### FinOps Filter Decision
+KB datapoints: 3+ → Mode: SEQUENTIAL
+Filter threshold: 0.3
+
+| H-ID | Sim Type | Est. Cost | ROI | Decision |
+|---|---|---|---|---|
+| H-41 | micro_sim_small | $0.01 | >10 | ADMIT |
+| H-42 | micro_sim_small | $0.01 | >10 | ADMIT |
+| H-43 | micro_sim_small | $0.01 | >10 | ADMIT |
+
+### Simulation: H-41 — Android Instrumented CI Host Mismatch
+
+**Type:** micro_sim_small  
+**Est. cost:** $0.01 | **Actual cost:** $0.01  
+**Blast radius:** HIGH
+
+**Setup:** inspect required GitHub Actions gate and the Android instrumented job definition.  
+**Reproduce:** `android-instrumented-test` runs on `macos-latest`, then executes `sudo tee /etc/udev/...` and `udevadm ...`, which are Linux/udev-specific commands.  
+**Execute:** source inspection of `ci.yml`.  
+**Assert:** the job encodes incompatible OS assumptions before emulator startup, so the required `ci-pass` gate can fail for infrastructure reasons instead of product regressions.  
+
+**Verdict:** ✅ CONFIRMED  
+**Evidence:** `ci.yml:166-203`, especially `ci.yml:184-189`, plus `ci-pass` hard-requires job success at `ci.yml:275-289`.  
+**Implication for [A]:** fix runner strategy or remove Linux-only setup from the macOS job before trusting the green/red signal.
+
+### Simulation: H-42 — Documentation / KB Drift
+
+**Type:** micro_sim_small  
+**Est. cost:** $0.01 | **Actual cost:** $0.01  
+**Blast radius:** MEDIUM
+
+**Setup:** compare README + KB claims against checked-in code.  
+**Reproduce:** README still says metadata remains visible unless TLS/Noise is added, and still documents first-contact `trustOnFirstUse = true`; old KB sections still say manifest `sequence`, header-value caps, and Noise transport are missing.  
+**Execute:** source trace across README, KB, mobile handshake code, Rust config, manifest verification, and transport module.  
+**Assert:** these claims are stale relative to current code: `MAX_HEADER_VALUE_BYTES` exists, manifest `sequence` is enforced, and mobile code rejects plaintext TOFU bootstrap.  
+
+**Verdict:** ✅ CONFIRMED  
+**Evidence:** `README.md:11`, `README.md:258-264`, `docs/VHEATM-KB-state.md:51-89`, `rust_core/src/config.rs:54-67`, `android/.../ManifestVerification.kt:61-80`, `ios/.../ManifestVerification.swift:139-163`, `ios/AetherApp/Managers/AetherManager.swift:141-165`, `android/.../AetherService.kt:529-548`, `rust_core/src/transport_encryption.rs:1-27`.  
+**Implication for [A]:** documentation must be treated as a release artifact with the same change discipline as code.
+
+### Simulation: H-43 — Runtime Rust Core Health
+
+**Type:** micro_sim_small  
+**Est. cost:** $0.01 | **Actual cost:** $0.01  
+**Blast radius:** MEDIUM
+
+**Setup:** run locally verifiable suites and compare counts/behavior to claims.  
+**Reproduce:** `cargo test` on `rust_core` completes successfully with 69 unit tests and 37 integration tests.  
+**Execute:** local command verification on current HEAD.  
+**Assert:** core Rust path is currently healthy; the dominant current risks are operational/doc drift, not obvious Rust regressions.  
+
+**Verdict:** ✅ CONFIRMED  
+**Evidence:** local `cargo test` on 2026-04-19: 69 unit + 37 integration tests passed.  
+**Implication for [A]:** prioritize release guardrail corrections over speculative transport rewrites in the next audit cycle.
+
+### Summary for [A]
+Confirmed: H-41, H-42, H-43  
+Rejected: None  
+Deferred: full end-to-end CI execution for Android emulator and iOS simulator in this environment
+
+### Cost Record (for KB datapoints)
+| Operation | Estimated | Actual | Delta |
+|---|---|---|---|
+| H-41 CI trace | $0.01 | $0.01 | 0 |
+| H-42 docs drift trace | $0.01 | $0.01 | 0 |
+| H-43 local Rust verify | $0.01 | $0.01 | 0 |
+
+## [A] Decide — Cycle #4 — 2026-04-19
+
+### New ADRs This Cycle
+
+#### ADR-022 | 🔴 MANDATORY
+**Problem:** Required CI currently contains a host/runner mismatch in the Android instrumented job, making the release gate untrustworthy.  
+**Decision:** Remove Linux-only `udev`/KVM setup from the `macos-latest` Android emulator job, or move that job to a Linux runner where those commands are valid.  
+**Evidence:** E-H-41 confirmed `ci.yml` mixes macOS runner selection with Linux-only commands.  
+**Pattern:** Keep runner-specific provisioning aligned with the declared OS before asserting CI coverage in docs or merge gates.  
+**Rejected Alternatives:** leave the job flaky/broken, mark failures as environmental noise, keep `ci-pass` dependent on a known-invalid job.
+**Initial weight:** 1.0 | **λ:** 0.20 | **Energy Tax priority:** 0.96
+
+#### ADR-023 | 🟠 REQUIRED
+**Problem:** README and KB now materially diverge from the runtime security and protocol contract, including onboarding rules and implemented mitigations.  
+**Decision:** Refresh README and KB whenever a security ADR lands; specifically remove claims that `sequence` is absent, that individual header values are uncapped, and that plaintext `/identity` supports TOFU bootstrap.  
+**Evidence:** E-H-42 confirmed code/docs mismatch across Rust, Android, iOS, and KB.  
+**Pattern:** Any merged security/protocol change must update both developer docs and KB state in the same PR.  
+**Rejected Alternatives:** rely on code comments only, defer docs until release, treat KB as historical notes rather than active truth.
+**Initial weight:** 1.0 | **λ:** 0.20 | **Energy Tax priority:** 0.88
+
+#### ADR-024 | 🟡 RECOMMENDED
+**Problem:** Test inventory claims are stale enough to weaken confidence in stated coverage.  
+**Decision:** Generate or update test-count claims from repo state/CI output instead of manually curating totals in README/CI comments.  
+**Evidence:** E-H-42 and E-H-43 confirmed mismatch: README says 23 iOS + 37 Python, while current repo contains 33 iOS tests and 38 Python test methods.  
+**Pattern:** Prefer generated counts or remove exact counts when they are not automatically maintained.  
+**Rejected Alternatives:** keep hand-maintained counts, update numbers ad hoc without guardrails.
+**Initial weight:** 1.0 | **λ:** 0.25 | **Energy Tax priority:** 0.64
+
+### Superseded ADRs
+- None
+
+### ADR Weight Decay This Cycle
+| ADR-ID | Previous Weight | New Weight | λ | Status |
+|---|---|---|---|---|
+| ADR-019 | 1.00 | 0.82 | 0.20 | ✅ ALIVE |
+| ADR-020 | 1.00 | 0.82 | 0.20 | ✅ ALIVE |
+| ADR-021 | 1.00 | 0.82 | 0.20 | ✅ ALIVE |
+
+## [M] Measure — Cycle #4 — 2026-04-19
+
+### Cycle Metrics
+| Metric | Value |
+|---|---|
+| Hypotheses confirmed | 3 |
+| Hypotheses rejected | 0 |
+| ADRs written | 3 (1 MANDATORY, 1 REQUIRED, 1 RECOMMENDED) |
+| Transforms applied | 0 |
+| Bugs prevented (est.) | 2 |
+| Total cycle cost | $0.03 |
+| ROI ratio | 26666.7 |
+| ROI net | $799.97 |
+
+### Burn Rate
+| Point | USD/hr | Tokens/hr |
+|---|---|---|
+| Session start | n/a | n/a |
+| Post-[G] | low | n/a |
+| Post-[E] | low | n/a |
+| Post-[T] | n/a | n/a |
+| Cycle end | low | n/a |
+
+### KB Pattern Registry — Post-Decay State
+| Pattern | Weight Before | Weight After | λ | Used This Cycle | Status |
+|---|---|---|---|---|---|
+| source_first_audit | 1.00 | 1.00 | 0.20 | ✅ | ✅ ALIVE |
+| ci_docs_contract_check | 0.82 | 1.00 | 0.20 | ✅ | ✅ ALIVE |
+| runtime_local_verify | 0.82 | 1.00 | 0.20 | ✅ | ✅ ALIVE |
+| stale_security_finding_revalidation | 1.00 | 1.00 | 0.20 | ✅ | ✅ ALIVE |
+
+### Patterns Reaching Fading Threshold (w < 0.1)
+- None observed this cycle
+
+### Next Step
+→ CYCLE COMPLETE — reason: high-signal audit findings were verified, no transform was requested, and the next best step is a focused remediation cycle for CI/docs rather than more diagnosis.
+
+### Proposed Next Cycle Scope (if continuing)
+- Fix `ci.yml` Android instrumented runner mismatch
+- Refresh README + KB to current transport/onboarding/test inventory
+- Optionally run full Android/iOS platform suites in a matching host environment
+
+## [E] Verify — Cycle #5 — 2026-04-20
+
+### Simulation: H-51 — Python Release Path Reproducibility
+
+**Type:** micro_sim_small  
+**Est. cost:** $0.01 | **Actual cost:** $0.01  
+**Blast radius:** MEDIUM
+
+**Setup:** create a local venv and install `tools/requirements.txt` exactly as CI would.  
+**Reproduce:** `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest` failed on April 20, 2026 because the pinned hash for `cryptography==42.0.8` did not match the downloaded wheel; the file also lacked hashes for `bsdiff4` and used an invalid placeholder hash for `zstandard`.  
+**Execute:** local install attempt plus wheel hash extraction for both local `cp312` and CI-target `cp311` Linux wheels.  
+**Assert:** Python toolchain reproducibility was broken by stale/incorrect hashes, independent of application code correctness.  
+
+**Verdict:** ✅ CONFIRMED  
+**Evidence:** local pip failure under PEP-517/hashed requirements workflow and wheel hash capture for `cryptography`, `zstandard`, and `bsdiff4`.  
+**Implication for [A]:** release-path security pinning must be treated as executable configuration, not documentation.
+
+### Summary for [A]
+Confirmed:
+- H-51 requirements hash drift in Python release path
+
+Rejected:
+- None
+
+Deferred:
+- Full multi-platform CI rerun outside the local audit environment
+
+### Cost Record
+| Operation | Estimated | Actual | Delta |
+|---|---|---|---|
+| H-51 venv + hash verification | $0.01 | $0.01 | 0 |
+
+## [A] Decide — Cycle #5 — 2026-04-20
+
+### New ADRs This Cycle
+
+#### ADR-025 | 🟠 REQUIRED
+**Problem:** `tools/requirements.txt` contained stale or invalid hashes, breaking reproducible installation for the forge tool path.  
+**Decision:** Maintain valid hashes for all pinned Python artifacts actually consumed by local/dev and CI-target environments; if cross-interpreter wheels are expected, include every accepted wheel hash or move generation to a trusted compile step.  
+**Evidence:** E-H-51 confirmed install failure before tests could start.  
+**Pattern:** Hash-pinned dependency files must be regenerated from actual resolver output whenever a package or interpreter target changes.  
+**Rejected Alternatives:** remove hashes entirely, keep placeholder hashes, rely on ad hoc local installs.
+**Initial weight:** 1.0 | **λ:** 0.20 | **Energy Tax priority:** 0.84
+
+## [M] Measure — Cycle #5 — 2026-04-20
+
+### Cycle Metrics
+| Metric | Value |
+|---|---|
+| Hypotheses confirmed | 1 |
+| Hypotheses rejected | 0 |
+| ADRs written | 1 (0 MANDATORY, 1 REQUIRED, 0 RECOMMENDED) |
+| Transforms applied | 1 |
+| Bugs prevented (est.) | 1 |
+| Total cycle cost | $0.01 |
+| ROI ratio | 20000.0 |
+| ROI net | $199.99 |
+
+### Next Step
+→ CYCLE COMPLETE — reason: current remediation scope is exhausted locally; next meaningful step is a CI rerun in GitHub Actions or platform-matched hosts.

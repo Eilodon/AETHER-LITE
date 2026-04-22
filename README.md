@@ -8,7 +8,7 @@
 
 Transfer a 10 GB AI model to a device with 512 MB RAM. Resume after network loss. Apply a 50 MB patch instead of re-downloading 1 GB. All verified with SHA-256. All authenticated with HMAC-SHA256 backed by hardware security chips.
 
-Current threat model: integrity checks are mandatory and enforced in Rust. The mobile SDK now supports peer-pin persistence and QR payload onboarding for authenticated ECDH, but discovery and camera/UI orchestration still belong to the embedding app. Plaintext `/identity` bootstrap now requires an existing pin or an out-of-band verified fingerprint; unauthenticated TOFU over HTTP is intentionally disabled. File bytes are session-encrypted after handshake, but HTTP metadata and control flow remain visible on the LAN unless you add TLS/Noise above it.
+Current threat model: integrity checks are mandatory and enforced in Rust. The mobile SDK now supports peer-pin persistence and QR payload onboarding for authenticated ECDH, but discovery and camera/UI orchestration still belong to the embedding app. Plaintext `/identity` bootstrap now requires an existing pin or an out-of-band verified fingerprint; unauthenticated TOFU over HTTP is intentionally disabled. The current transport path supports Noise NK session establishment plus legacy ChaCha20 defense-in-depth for file bytes during compatibility flows.
 
 ---
 
@@ -125,6 +125,7 @@ Drag `libaether_core.a` + generated files into Xcode. Run tests: `⌘U`.
 ```bash
 cd tools
 pip install -r requirements.txt
+pip install pytest
 
 # Generate keypair (once)
 python forge.py keygen --out ./keys
@@ -220,7 +221,7 @@ try await AetherManager.shared.applySmartPatch(
 | Layer | Mechanism |
 |-------|-----------|
 | Device identity | ECDH P-256 — Android Keystore TEE / iOS Secure Enclave |
-| Auth ticket | `model\|version\|timestamp.HMAC-SHA256`, ±60s replay window |
+| Auth ticket | `model\|version\|timestamp[\|counter]\|issuer.HMAC-SHA256`, ±60s replay window |
 | Timing attack | Constant-time HMAC comparison |
 | Key derivation | HKDF-SHA256 from raw ECDH output, label `aether-hmac-v1` |
 | Manifest integrity | ECDSA-P256-SHA256, verified on-device before any patch |
@@ -234,15 +235,19 @@ try await AetherManager.shared.applySmartPatch(
 
 ## Test Coverage
 
-| Scope | Tests | CI-enforced |
-|-------|-------|-------------|
-| Rust unit | 69 | ✅ `cargo test` |
-| Rust integration | 37 | ✅ `cargo test` |
-| Android JVM unit | 19 | ✅ `gradlew testDebugUnitTest` |
-| Android instrumented | 6 | ✅ `gradlew connectedDebugAndroidTest` |
-| iOS XCTest | 23 | ✅ `xcodebuild test` |
-| Python (forge tool) | 37 | ✅ `pytest forge_test.py` |
-| **Total** | **191** | **All CI-enforced** |
+| Scope | CI command |
+|-------|------------|
+| Rust unit + integration | `cargo test` |
+| Android JVM unit | `./gradlew :app:testDebugUnitTest` |
+| Android instrumented | `./gradlew :app:connectedDebugAndroidTest` |
+| iOS XCTest | `xcodebuild test ...` |
+| Python (forge tool) | `pytest forge_test.py -v` |
+
+Repository-local counts observed on April 19, 2026:
+- Rust: 69 unit + 37 integration tests passed locally.
+- Android: 19 JVM unit tests and 6 instrumented tests declared in source.
+- iOS: 33 XCTest methods declared in `ios/AetherAppTests/AetherTests.swift`.
+- Python: 38 pytest test methods declared in `tools/forge_test.py`.
 
 ---
 
@@ -255,13 +260,14 @@ start_server() → :port
 exportSelfPeerOnboardingURI()
         ── QR / deep-link / share sheet ──→ importPeerPin(onboardingURI)
 
-or, if no QR step is available yet:
-        ───────────── trusted first contact over LAN ─────────────→
-        performAuthenticatedHandshake(..., trustOnFirstUse = true)
-        store TOFU pin locally for future sessions
+first contact requires either:
+        ── QR / deep-link onboarding already imported ──→
+        or
+        ── caller supplies expected peer fingerprint out-of-band ──→
 
-performAuthenticatedHandshake(..., trustOnFirstUse = false) on later sessions
-fetch /identity → verify stored peer pin → ECDH → registerPeerKey()
+performAuthenticatedHandshake(...)
+fetch /identity → verify existing pin or expected fingerprint → ECDH → registerPeerKey()
+register_peer_noise_static_key() → establish_noise_session()
 grantPeerModelAccess(uuid_B, model)         registerPeerKey(uuid_A, shared_secret)
 register_file_for_serving(model_id, path)
 
@@ -270,7 +276,8 @@ register_file_for_serving(model_id, path)
 verify_ticket() ✓
                        ──── 206 / 200 stream ────→
                             [socket → kernel → fd → disk]
-                            [transport key stream-encrypted]
+                            [Noise-backed session when established]
+                            [ChaCha20 compatibility path otherwise]
                             [SHA-256 verified inline]
 
 Admin:  forge publish → patch.bin + manifest.json (ECDSA signed)

@@ -163,7 +163,7 @@ jobs:
   # ── Android instrumented tests (ADR-002) ──────────────────────────────────
   android-instrumented-test:
     name: Android instrumented tests
-    runs-on: macos-latest  # macOS required for hardware-accelerated emulator
+    runs-on: macos-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -180,13 +180,6 @@ jobs:
       - name: Make Gradle wrapper executable
         working-directory: android
         run: chmod +x gradlew
-
-      # ADR-002: Enable KVM for hardware-accelerated emulator on macOS runners
-      - name: Enable KVM group permissions
-        run: |
-          echo "KERNEL==\"kvm\", GROUP=\"kvm\", MODE=\"0666\", OPTIONS=\"static_node=kvm\"" | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
 
       - name: Run Android instrumented tests
         working-directory: android
@@ -219,6 +212,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-ios-sim
+
+      - name: Install xcpretty
+        run: gem install xcpretty --no-document
 
       - name: Cache Cargo
         uses: actions/cache@v4
@@ -262,9 +258,11 @@ jobs:
           key: pip-${{ hashFiles('tools/requirements.txt') }}
 
       - name: Install dependencies
-        run: pip install -r tools/requirements.txt pytest
+        run: |
+          pip install -r tools/requirements.txt
+          pip install pytest
 
-      - name: Run forge tests (28 tests)
+      - name: Run forge tests
         working-directory: tools
         run: pytest forge_test.py -v
 

@@ -5,15 +5,27 @@
 # Core crypto library - pinned to latest stable
 # Release notes: https://cryptography.io/en/latest/changelog/
 cryptography==42.0.8 \
-    --hash=sha256:456048c7e371c089a79f6bcb5a806d716a57c6e24c61d470c56e297de6e40f81
+    --hash=sha256:a0608251135d0e03111152e41f0cc2392d1e74e35703960d4190b2e0f4ca9c70 \
+    --hash=sha256:9c0c1716c8447ee7dbf08d6db2e5c41c688544c61074b54fc4564196f55c25a7
+
+# Transitive deps required by cryptography under hash mode
+cffi==2.0.0 \
+    --hash=sha256:8941aaadaf67246224cee8c3803777eed332a19d909b47e29c9842ef1e79ac26 \
+    --hash=sha256:3e17ed538242334bf70832644a32a7aae3d83b57567f9fd60a26257e992b79ba
+
+pycparser==2.23 \
+    --hash=sha256:e5c6e8d3fbad53479cab09ac03729e0a9faf2bee3db8208a550daf5af81a5934
 
 # Zstd compression - pinned to latest stable
 zstandard==0.22.0 \
-    --hash=sha256:2a8f8c1c14e2e585235e8a5c4d5c6a58b3c911d6a3088f4e4b6f8a8b8c8d8e8f
+    --hash=sha256:33591d59f4956c9812f8063eff2e2c0065bc02050837f152574069f5f9f17775 \
+    --hash=sha256:466e6ad8caefb589ed281c076deb6f0cd330e8bc13c5035854ffb9c2014b118c
 
 # CLI framework - stable API
 click==8.1.7 \
-    --hash=sha256:ca9853ad459e787e2192211578cc907e7594e294c7ccc834310722b41b9ca6dd
+    --hash=sha256:ae74fb96c20a0277a1d615f1e4d73c8414f5a98db8b799a7931d1582f3390c28
 
 # Binary diff patching
-bsdiff4==1.2.4
+bsdiff4==1.2.4 \
+    --hash=sha256:14c39e4c2f4ad32c19f56d31b659b83d94ed992f4f3274f3ab973b339f780b8c \
+    --hash=sha256:5cc9c84464411f406b37ee2b0833c9feb58f93e504c8989aad5120077abcc9c2

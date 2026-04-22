@@ -1,5 +1,9 @@
 # AETHER Project Knowledge Base (KB-state)
 
+> Historical KB snapshot from 2026-04-16.
+> This file preserves an earlier VHEATM cycle and contains findings that were later refined or resolved.
+> Use `docs/VHEATM-KB-state.md` as the living KB for current-state decisions.
+
 ## Project Overview
 - **Name:** AETHER LITE
 - **Description:** P2P zero-copy file transfer + surgical binary patching SDK for Android & iOS.

@@ -1,6 +1,10 @@
 # BÁO CÁO AUDIT BẢO MẬT CUỐI CÙNG - Aether LITE v2.3.2
 ## Final Security Assessment Report
 
+> Historical snapshot dated 2026-04-16.
+> Several findings in this report were valid at that time but have since been partially or fully remediated on HEAD.
+> For current repo state, read `docs/VHEATM-KB-state.md` and validate against code before treating any item below as an active finding.
+
 **Ngày Audit**: 16/04/2026  
 **Auditor**: VHEATM Security Assessment  
 **Scope**: Rust Core, Android (Kotlin), iOS (Swift), Python Tools  
